@@ -1,16 +1,11 @@
-import os
+import time
 import torch
 import math
-import json
+from config import CONFIG
 from potentials import PotentialsManager
 from nbody_solver import DirectNBodySolver
 from pm_solver import ParticleMeshSolver
 from kernels import make_backend
-
-# --- Load Configuration ---
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
-with open(CONFIG_PATH, 'r') as f:
-    CONFIG = json.load(f)
 
 WIDTH = CONFIG["display"]["WIDTH"]
 HEIGHT = CONFIG["display"]["HEIGHT"]
@@ -22,8 +17,10 @@ PHYSICS_CELL_SIZE = CONFIG["simulation"]["PHYSICS_CELL_SIZE"]
 MAX_PARTICLES = CONFIG["simulation"]["MAX_PARTICLES"]
 # Thermal spawn velocity spread for non-gravity potentials (at spawn_velocity = 1)
 THERMAL_SPEED = 1250.0
-# Direct N-body allocates ~10 dense N x N float32 tensors per step (~4 GB at N = 10,000)
+# Direct N-body is O(N^2) work per step (memory is tiled, so speed is the limit: ~10k is interactive on an iGPU)
 NBODY_MAX_PARTICLES = CONFIG["simulation"].get("NBODY_MAX_PARTICLES", 10000)
+# Slider-driven kernel rebuilds wait until the value has been still this long (seconds)
+KERNEL_REBUILD_DELAY = 0.15
 
 UNIVERSE_W = int(PHYSICS_GRID_W * PHYSICS_CELL_SIZE)
 UNIVERSE_H = int(PHYSICS_GRID_H * PHYSICS_CELL_SIZE)
@@ -114,6 +111,8 @@ class SimulationEngine:
         # Re-sort particles by grid cell every N steps so CIC scatter/gather hit memory coherently (0 = off)
         self.sort_interval = CONFIG["simulation"].get("SORT_INTERVAL", 50)
         self.step_count = 0
+        # Pending slider-driven kernel rebuild (see request_kernel_rebuild)
+        self._kernel_dirty_since = None
 
         # Initialize helper managers and solvers
         self.pot_manager = PotentialsManager(GRID_W, GRID_H, PHYSICS_CELL_SIZE, self.device)
@@ -138,10 +137,19 @@ class SimulationEngine:
         self.vel[:n] = self.vel[:n][order]
         self.masses[:n] = self.masses[:n][order]
 
+    def request_kernel_rebuild(self):
+        """
+        Debounced kernel rebuild for slider drags (AUDIT 3.6): the rebuild happens in step() once the parameter
+        has been unchanged for KERNEL_REBUILD_DELAY seconds, instead of every frame while dragging (a harmonic/LJ
+        rebuild is a full-grid FFT).
+        """
+        self._kernel_dirty_since = time.perf_counter()
+
     def precompute_kernel(self):
         """
         Triggers potentials precomputation inside solvers on parameter change.
         """
+        self._kernel_dirty_since = None
         params = {
             'G': self.G,
             'force_range': self.gravity_range,
@@ -254,6 +262,8 @@ class SimulationEngine:
         self.num_active += total_spawn
 
     def step(self, dt):
+        if self._kernel_dirty_since is not None and time.perf_counter() - self._kernel_dirty_since >= KERNEL_REBUILD_DELAY:
+            self.precompute_kernel()
         if self.num_active == 0:
             return
 

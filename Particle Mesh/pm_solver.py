@@ -18,13 +18,8 @@ class ParticleMeshSolver:
         self.fy = torch.zeros((self.grid_h, self.grid_w), device=self.device)
         self.rho_k = None  # rfft2 of the last deposited density; reused by the FFT minimap and bandpass view
 
-        # Precompute k_sq for FFT
-        kx = torch.fft.fftfreq(self.grid_w, d=self.cell_size, device=self.device) * 2 * math.pi
-        ky = torch.fft.fftfreq(self.grid_h, d=self.cell_size, device=self.device) * 2 * math.pi
-        kx_grid, ky_grid = torch.meshgrid(kx, ky, indexing='xy')
-
-        self.k_sq = kx_grid**2 + ky_grid**2
-        self.k_sq[0, 0] = 1e-8
+        # |k|^2 in rfft2 layout (H, W//2 + 1), shared with the potentials manager
+        self.k_sq = potentials_manager.k_sq
 
         self.K_k = None
         self.active_potential_type = None
@@ -72,9 +67,8 @@ class ParticleMeshSolver:
         softening_length = params.get('softening_length', 1.5)
         key = (id(self.K_k), softening_length)
         if self._K_eff_key != key:
-            cols = rho_k.shape[1]
-            gaussian = torch.exp(-self.k_sq[:, :cols] * (softening_length**2) / 2.0)
-            self._K_eff = self.K_k[:, :cols] * gaussian
+            gaussian = torch.exp(-self.k_sq * (softening_length**2) / 2.0)
+            self._K_eff = self.K_k * gaussian
             self._K_eff_key = key
         phi_k = rho_k * self._K_eff
         if potential_type == 'harmonic':
@@ -107,7 +101,7 @@ class ParticleMeshSolver:
                 number_k = rho_k
             smooth_len = max(softening_length, self.cell_size)
             if self._smooth_key != smooth_len:
-                self._smooth = torch.exp(-self.k_sq[:, :number_k.shape[1]] * (smooth_len**2) / 2.0)
+                self._smooth = torch.exp(-self.k_sq * (smooth_len**2) / 2.0)
                 self._smooth_key = smooth_len
             area = self.cell_size ** 2
             rho_smooth = torch.fft.irfft2(number_k * self._smooth, s=self.density_grid.shape).clamp_(min=0.0).div_(area)

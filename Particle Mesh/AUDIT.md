@@ -19,13 +19,13 @@ Severity: **High** = wrong results, crash, or a feature that silently does nothi
 | 3 | High | Friction factor `(1 - friction*dt)` goes negative at high friction × time scale and blows up the velocities. | `pm_solver.py:50-51`, `engine.py:229-230` | Done (PR #1) |
 | 4 | High | N-body view ignores zoom: the culling and normalisation use screen pixels as world units. | `main.py:270-278`, `circle_renderer.py:21-22,46-47` | Done (PR #1) |
 | 5 | High | N-body mode has no particle cap after startup. One brush stroke spawns ~785k particles, which needs terabytes for the N×N matrices, so it OOMs or hangs. | `main.py:61-64,234-237`, `nbody_solver.py:24-39` | Done (PR #1) |
-| 6 | High | Mouse-wheel zoom and brush resize are dead code: Taichi 1.7.4 GGUI emits no wheel events. **Verified in source.** | `main.py:166-172` | Open |
+| 6 | High | Mouse-wheel zoom and brush resize are dead code: Taichi 1.7.4 GGUI emits no wheel events. **Verified in source.** | `main.py:166-172` | Done (PR #6): dead code and legend hints removed |
 | 7 | Medium | The k=0 (mean) mode of the potential isn't zeroed. That adds a huge constant to φ, which wrecks float32 precision at large force range and washes out the potential view. | `potentials.py:39-47,79-88` | Done (PR #1) |
 | 8 | Medium | Forces are periodic (FFT) but particles are deleted at the edges, not wrapped. Mass near one edge pulls particles at the opposite edge. The GUI calls this mode "UNIVERSE WRAPPED". | `engine.py:198-206`, `gui.py:113` | Done (PR #3) |
 | 9 | Medium | Pressure is applied as acceleration `-P∇ρ^γ` rather than `-∇P/ρ`, so it explodes in dense regions. | `potentials.py:106-115` | Done (PR #5) |
 | 10 | Medium | Potential, field and bandpass views are wrong whenever `RENDER_CELL_SIZE ≠ 1` (the local `config.json` uses 2). | `main.py:283-296,380-381` | Done (PR #1, #2) |
 | 11 | Medium | Particle data is read 3–4 times per frame plus a GPU sync. At 100M particles that is about 6–7 GB of memory traffic per frame. | `engine.py:199-206`, `pm_solver.py`, `mesh_renderer.py:37-46` | Partial (PR #3): sync removed, cell sorting and a shared CIC stencil added; the single fused kernel is option B |
-| 12 | Medium | About 1 GB of redundant precomputed grids, and the kernel is stored as full complex when only half is used. | `potentials.py:12-25`, `pm_solver.py:69-74` | Partial (PR #3): softened kernel cached; duplicate grids and full-complex `K_k` remain |
+| 12 | Medium | About 1 GB of redundant precomputed grids, and the kernel is stored as full complex when only half is used. | `potentials.py:12-25`, `pm_solver.py:69-74` | Done (PR #3, #6) |
 | 13 | High (XPU) | The August Arc port passes XPU tensors into Taichi Vulkan kernels. Taichi copies every argument to the CPU and back on every call. **Verified, measured.** | `pm_solver.py` (August copy) | Done (PR #3) |
 | 14 | Medium (XPU) | The port's Vulkan Poisson fallback (12 red-black Gauss-Seidel sweeps) is far from converged, so its gravity is effectively ~12-cell range. | same | Done (PR #3, removed) |
 | 15 | Low | Two diverged copies of the project, and neither is under working version control. | — | Done (repo `cgadre4/PPS`) |
@@ -135,6 +135,15 @@ The minimap size (`main.py:380-381`) is also in pixels but is written into a ren
 `orbital_speed = sqrt(|G|·100/(r+10))` (`engine.py:131`) is an arbitrary profile. For the 2D PM law, the circular speed is `v² = G·M(<r)/(2π)`. For the "dense core" distribution (r uniform), M(<r) = count·r/R, so `v = sqrt(G·count·r/(2π·R))` (divided by cell_size² once 2.11 is fixed). The current formula makes disks either fly apart or collapse depending on brush size and density. `spawn_vel` then multiplies whatever the result is.
 
 ### 2.13 Smaller issues
+**Fixed** (PR #6):
+- the image list is cached, with a "Rescan Images" button;
+- view and bandpass slider ranges come from `config.json`;
+- the unused `show_fft_panel` is gone;
+- the Coulomb colour tensors are created once;
+- `image_loader` reports when an image yields no particles.
+
+Not changed: `time.sleep` throttling (the project now runs on Python 3.13, with high-resolution timers), and `dt` from the target frame time (kept deliberately for deterministic steps; documented in AGENTS.md).
+
 - `gui.py:91-94, 235-237`: the view and bandpass sliders hard-code their ranges (−5…15, 0…5) and ignore the `config.json` ranges, which differ.
 - `gui.py:202-205`: five `glob.glob` calls per frame, which is a filesystem query 120 times a second (much worse when run from a Google Drive virtual disk). Cache the list and add a "Rescan" button.
 - `gui.py:15`: `show_fft_panel` is never used.
@@ -148,6 +157,14 @@ The minimap size (`main.py:380-381`) is also in pixels but is written into a ren
 ## 3. Performance and memory
 
 ### 3.1 Memory footprint at the shipped config (100M particles, 7680² grid)
+**Fixed** (PR #3, #6):
+- `kx_grid`/`ky_grid` are gone, and one `k_sq` in rfft2 layout is shared.
+- The distance grid is built on demand only.
+- Kernels are built directly in rfft2 layout: real float32 for gravity/Coulomb, `rfft2` for harmonic/LJ.
+- `K_eff` (kernel × softening) is cached.
+
+At 7680² that removes ~1.2 GB of persistent grids.
+
 | Item | Size |
 |------|------|
 | `pos`, `vel` (float32, MAX_PARTICLES×2), `masses` (int8) | 1.7 GB |
@@ -184,13 +201,26 @@ Fixes:
 `main.py` recomputes `rfft2(density_grid)` for the bandpass render view and again for the FFT minimap, on top of the solver's own forward FFT. Keep `rho_k` on the solver (it's already computed in `solve`) and reuse it. The bandpass mask code is also duplicated verbatim (`main.py:311-320` and `366-375`); extract it into one function and cache the mask until the sliders change.
 
 ### 3.4 Force differencing
+**Fixed** (PR #3): periodic central differences with `torch.roll` when the boundary is periodic.
+
 `torch.gradient` allocates two new grids and uses one-sided differences at the edges, which doesn't match the periodic solve. Use either a periodic central difference with `torch.roll`, or a single fused kernel that writes `fx`/`fy` in place. Spectral differentiation (`i·k·φ_k`) is exact but needs two inverse FFTs, so only consider it if accuracy matters more than speed.
 
 ### 3.5 N-body solver
+**Fixed** (PR #6): row-tiled pairwise computation with separate x/y arrays and in-place ops.
+
+| Particles | Before | After |
+|---|---|---|
+| 10k | 3.35 GiB, 180 ms | 0.13 GiB, 146 ms |
+| 20k | 13.4 GiB, 842 ms | 0.13 GiB, 630 ms |
+
+Skipping the screening at maximum range was *not* done: `exp(-r/8192)` is still 0.6 at r = 4096, so skipping it would change the physics. The cap stays at 10k because the solver is speed-bound on the iGPU; it's configurable.
+
 - **Memory:** about ten dense N×N tensors. Process the target particles in row blocks (e.g. 1024–4096 rows) against all sources, so memory is O(N·block) and N = 50k+ becomes feasible.
 - **Cost:** `screening = exp(-r/range)` is always computed, even when the range is at its maximum. Skip it when `range ≥ universe size`.
 
 ### 3.6 Kernel rebuilds while dragging sliders
+**Fixed** (PR #6): sliders call `engine.request_kernel_rebuild()`. The rebuild runs once the value has been still for 0.15 s.
+
 Every frame that a G, range, spring or LJ slider moves rebuilds the kernel. For harmonic and LJ that means a full-grid `fft2` (472 MB of complex output) plus several 236 MB temporaries such as `r**2` and `(σ/r)^12`. Rebuild on slider release, or at most every ~100 ms.
 
 ---
@@ -199,8 +229,12 @@ Every frame that a G, range, spring or LJ slider moves rebuilds the kernel. For 
 
 - **Two diverged copies.** At audit time, the June Google Drive copy and the August laptop copy had drifted apart, and neither was under version control. *Resolved:* the August copy is now this repo. The Google Drive copy (`GDrive\Documents\Scripts\PPS\Particle Mesh`) is stale; don't put a `.git` folder there, because Google Drive syncing can corrupt it.
 - **Relative `config.json` paths and import-time side effects.** `main.py`, `engine.py` and `mesh_renderer.py` each load the config with a relative path. `mesh_renderer.py` and `circle_renderer.py` allocate Taichi fields at import. One `config.py` with an absolute path (the August copy already does the path part) plus lazy field allocation would make the modules importable in tests.
+  - *Status, PR #6:* `config.py` is now the only reader of `config.json`.
+  - Taichi fields are still allocated at import. The tests work around it by importing `main` first, so lazy allocation was left as is.
 - **`main.py` does too much.** Input handling, view resampling, colouring and overlays all live in one 420-line loop. Move the PM view and overlay logic into `MeshRenderer` (which also fixes 2.1), and keep the key edge-trigger state in a dict.
-- **No tests.** Taichi's `ti.cpu` arch plus CPU tensors runs the real kernels with zero-copy, so headless physics checks are cheap:
+  - *Status, PR #6:* the PM views, minimap, bandpass and arrows moved into `MeshRenderer.render_pm`, and `main.py` dropped ~110 lines.
+  - The input edge-trigger variables were left as they are (cosmetic).
+- **No tests.** *Resolved (PR #4 onwards): `tests/`, run with `uv run pytest`, all headless.* Taichi's `ti.cpu` arch plus CPU tensors runs the real kernels with zero-copy, so headless physics checks are cheap:
   - Two-body force against the analytic 2D law, for PM and N-body: this catches the 2π mismatch.
   - Total momentum stays ~0 for a symmetric configuration.
   - Coulomb: an opposite-charge pair attracts and a like-charge pair repels in both solvers: this catches 2.2.
@@ -271,6 +305,8 @@ Native GPU kernels with atomics should be roughly as fast as the Taichi Vulkan n
 2. ~~Quick correctness fixes: 2.3 damping, 2.7 `K[0,0] = 0`, 2.2 Coulomb charge, 2.4 N-body zoom, 2.5 N-body cap, 2.1 overlay order.~~ **Done** on branch `fix/quick-correctness`. That branch also fixed the minimap's size when `RENDER_CELL_SIZE ≠ 1` and the point-reflection mirroring. Still open in 2.1: redundant FFTs (3.3) and antialiasing.
 3. ~~XPU option A, to get the app running on this laptop.~~ **Done** on branch `feat/xpu-port`. It adds a pure-PyTorch kernel backend with a shared CIC stencil, periodic cell sorting, all rendering in PyTorch, a 2048² grid, reuse of `rho_k`, a cached `K_eff` and a LUT colormap. Measured on the B390: 1M particles ≈ 17 ms/frame (≈59 FPS), 4M ≈ 42 ms. The old path took 115 ms for physics alone at 1M. CUDA machines keep the Taichi kernels via `kernels.TaichiBackend`; that path is parity-tested on Taichi CPU but not run on CUDA here.
 4. Install MSVC Build Tools and move to option B (Triton fused particle kernel). The hot paths are already isolated in `kernels_torch.py`, and `TORCH_COMPILE: true` will try `torch.compile` and fall back to eager if it fails. Benchmark against the numbers in step 3.
-5. ~~Boundary model (2.8)~~ (done in the XPU port), pressure form (2.9), units and parity (2.11), and a small physics test suite.
+5. ~~Boundary model (2.8), pressure form (2.9), units and parity (2.11), and a small physics test suite.~~ **Done:** 2.8 in PR #3, the test suite in PR #4, 2.9/2.11/2.12 in PR #5. The cleanup items (6, 2.13, 3.1, 3.5, 3.6, §4) are in PR #6.
+
+**Remaining:** only option B (fused Triton kernels, item 11's last part). It's blocked until Visual Studio 2022 Build Tools are installed.
 
 The benchmarks were run with throwaway scripts (`bench_xpu.py`, `bench_xpu2.py`, `test_set_image_order.py`) that are not committed. Ask for them to be re-created under a `bench/` folder if needed.
