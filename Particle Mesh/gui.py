@@ -41,7 +41,7 @@ class SimulationGUI:
         gui.text("--- SYSTEM STATS ---")
         gui.text(f"Solver: {self.engine.solver_type.upper()}")
         gui.text(f"FPS: {fps_display:.1f} / {self.config['display']['FPS_TARGET']:.0f}")
-        gui.text(f"Total Stars: {self.engine.num_active} / {self.config['simulation']['MAX_PARTICLES']}")
+        gui.text(f"Total Stars: {self.engine.num_active} / {self.engine.capacity()}")
         
         gui.text("")
         gui.text("--- ACTIVE POTENTIAL ---")

@@ -28,8 +28,10 @@ def scatter_mass_kernel(
 
 @ti.kernel
 def gather_and_integrate_kernel(
-    pos: ti.types.ndarray(), vel: ti.types.ndarray(), force_x: ti.types.ndarray(), force_y: ti.types.ndarray(),
-    num_active: ti.i32, grid_w: ti.i32, grid_h: ti.i32, cell_size: ti.f32, dt: ti.f32, friction: ti.f32
+    pos: ti.types.ndarray(), vel: ti.types.ndarray(), mass: ti.types.ndarray(),
+    force_x: ti.types.ndarray(), force_y: ti.types.ndarray(),
+    num_active: ti.i32, grid_w: ti.i32, grid_h: ti.i32, cell_size: ti.f32, dt: ti.f32, damping: ti.f32,
+    use_charge: ti.i32
 ):
     for p in range(num_active):
         x = pos[p, 0] / cell_size - 0.5
@@ -47,8 +49,13 @@ def gather_and_integrate_kernel(
         fx = force_x[j, i]*w00 + force_x[j, i+1]*w10 + force_x[j+1, i]*w01 + force_x[j+1, i+1]*w11
         fy = force_y[j, i]*w00 + force_y[j, i+1]*w10 + force_y[j+1, i]*w01 + force_y[j+1, i+1]*w11
 
-        vel[p, 0] = (vel[p, 0] + fx * dt) * (1.0 - friction * dt)
-        vel[p, 1] = (vel[p, 1] + fy * dt) * (1.0 - friction * dt)
+        # Coulomb: the field is a charge potential, so the force on a particle scales with its own charge (+/-1)
+        q = 1.0
+        if use_charge != 0:
+            q = ti.cast(mass[p], ti.f32)
+
+        vel[p, 0] = (vel[p, 0] + q * fx * dt) * damping
+        vel[p, 1] = (vel[p, 1] + q * fy * dt) * damping
         
         pos[p, 0] += vel[p, 0] * dt
         pos[p, 1] += vel[p, 1] * dt
@@ -167,16 +174,21 @@ class ParticleMeshSolver:
             self.fx += force_px
             self.fy += force_py
             
+        # Exponential friction decay: stays in (0, 1] for any friction * dt, unlike (1 - friction * dt)
+        damping = math.exp(-friction * dt)
+
         # Taichi force gathering and integration
         gather_and_integrate_kernel(
-            pos, 
-            vel, 
-            self.fx, 
-            self.fy, 
-            num_active, 
-            self.grid_w, 
-            self.grid_h, 
-            float(self.cell_size), 
-            float(dt), 
-            float(friction)
+            pos,
+            vel,
+            masses,
+            self.fx,
+            self.fy,
+            num_active,
+            self.grid_w,
+            self.grid_h,
+            float(self.cell_size),
+            float(dt),
+            float(damping),
+            1 if potential_type == 'coulomb' else 0
         )

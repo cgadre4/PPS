@@ -45,7 +45,6 @@ class PotentialsManager:
                 denom_safe[0, 0] = 1e-8
                 
             K_k = -G / denom_safe
-            return K_k
             
         elif potential_type == 'harmonic':
             spring_k = params.get('spring_k', 1.0)
@@ -55,7 +54,6 @@ class PotentialsManager:
             # Universal force-range screening prevents boundary periodic jumps
             V = V * torch.exp(-self.r / force_range)
             K_k = torch.fft.fft2(V)
-            return K_k
             
         elif potential_type == 'lennard_jones':
             epsilon = params.get('epsilon', 100.0)
@@ -71,7 +69,6 @@ class PotentialsManager:
             # Universal force-range screening smooths outer cutoff
             V = V * torch.exp(-self.r / force_range)
             K_k = torch.fft.fft2(V)
-            return K_k
             
         elif potential_type == 'coulomb':
             ke = params.get('G', 1.0)
@@ -86,10 +83,15 @@ class PotentialsManager:
                 
             # Repelling force for like charges: positive sign
             K_k = ke / denom_safe
-            return K_k
-            
+
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
+
+        # Zero the k = 0 (mean) mode. It only adds a constant to phi, which exerts no force, but for gravity/Coulomb
+        # it equals -/+G * M_total / lambda^2: large enough to destroy float32 precision in phi (and therefore in
+        # the finite-difference forces) and to wash out the potential view.
+        K_k[0, 0] = 0.0
+        return K_k
 
     def compute_pressure_forces(self, density, pressure_strength, gamma):
         """

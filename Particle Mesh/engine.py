@@ -19,6 +19,8 @@ PHYSICS_GRID_W = CONFIG["simulation"].get("PHYSICS_GRID_W", 7680)
 PHYSICS_GRID_H = CONFIG["simulation"].get("PHYSICS_GRID_H", 7680)
 PHYSICS_CELL_SIZE = CONFIG["simulation"]["PHYSICS_CELL_SIZE"]
 MAX_PARTICLES = CONFIG["simulation"]["MAX_PARTICLES"]
+# Direct N-body allocates ~10 dense N x N float32 tensors per step (~4 GB at N = 10,000)
+NBODY_MAX_PARTICLES = CONFIG["simulation"].get("NBODY_MAX_PARTICLES", 10000)
 
 UNIVERSE_W = int(PHYSICS_GRID_W * PHYSICS_CELL_SIZE)
 UNIVERSE_H = int(PHYSICS_GRID_H * PHYSICS_CELL_SIZE)
@@ -118,12 +120,29 @@ class SimulationEngine:
         }
         self.pm_solver.update_kernel(self.potential_type, params)
 
+    def capacity(self):
+        """
+        Maximum number of active particles for the current solver.
+        """
+        if self.solver_type == 'nbody':
+            return min(MAX_PARTICLES, NBODY_MAX_PARTICLES)
+        return MAX_PARTICLES
+
+    def _new_masses(self, count):
+        """
+        Masses for newly spawned particles: 1, or a random +/-1 charge in Coulomb mode.
+        """
+        if self.potential_type == 'coulomb':
+            return torch.randint(0, 2, (count,), device=self.device, dtype=torch.int8) * 2 - 1
+        return torch.ones(count, device=self.device, dtype=torch.int8)
+
     def add_galaxy(self, world_x, world_y, world_radius, count=5000, vel_mult=0.0):
         count = int(count)
-        if count <= 0 or self.num_active >= MAX_PARTICLES:
+        capacity = self.capacity()
+        if count <= 0 or self.num_active >= capacity:
             return
-            
-        count = min(count, MAX_PARTICLES - self.num_active)
+
+        count = min(count, capacity - self.num_active)
         
         if self.uniform_spawn:
             r = torch.sqrt(torch.rand(count, device=self.device)) * world_radius
@@ -148,7 +167,7 @@ class SimulationEngine:
         start, end = self.num_active, self.num_active + count
         self.pos[start:end] = new_pos
         self.vel[start:end] = new_vel
-        self.masses[start:end] = 1
+        self.masses[start:end] = self._new_masses(count)
         self.num_active += count
 
     def remove_particles(self, world_x, world_y, world_radius):
@@ -172,10 +191,11 @@ class SimulationEngine:
             return
             
         total_spawn = len(np_coords)
-        if total_spawn == 0 or self.num_active >= MAX_PARTICLES:
+        capacity = self.capacity()
+        if total_spawn == 0 or self.num_active >= capacity:
             return
-            
-        available_slots = MAX_PARTICLES - self.num_active
+
+        available_slots = capacity - self.num_active
         if total_spawn > available_slots:
             np_coords = np_coords[:available_slots]
             total_spawn = len(np_coords)
@@ -183,7 +203,7 @@ class SimulationEngine:
         start, end = self.num_active, self.num_active + total_spawn
         self.pos[start:end] = torch.from_numpy(np_coords).to(self.device)
         self.vel[start:end] = 0.0
-        self.masses[start:end] = 1
+        self.masses[start:end] = self._new_masses(total_spawn)
         self.num_active += total_spawn
 
     def step(self, dt):
@@ -234,9 +254,10 @@ class SimulationEngine:
                 params
             )
             
-            # Euler integration for velocity and positions
-            self.vel[:self.num_active, 0] = (self.vel[:self.num_active, 0] + ax * dt) * (1.0 - self.friction * dt)
-            self.vel[:self.num_active, 1] = (self.vel[:self.num_active, 1] + ay * dt) * (1.0 - self.friction * dt)
+            # Euler integration for velocity and positions (exponential friction decay never flips sign)
+            damping = math.exp(-self.friction * dt)
+            self.vel[:self.num_active, 0] = (self.vel[:self.num_active, 0] + ax * dt) * damping
+            self.vel[:self.num_active, 1] = (self.vel[:self.num_active, 1] + ay * dt) * damping
             
             self.pos[:self.num_active, 0] += self.vel[:self.num_active, 0] * dt
             self.pos[:self.num_active, 1] += self.vel[:self.num_active, 1] * dt

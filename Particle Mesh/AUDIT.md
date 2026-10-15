@@ -248,7 +248,7 @@ Native GPU kernels with atomics should be roughly as fast as the Taichi Vulkan n
 
 ## 6. Suggested order of work
 1. Consolidate into one git repo (§4).
-2. Quick correctness fixes: 2.3 damping, 2.7 `K[0,0] = 0`, 2.2 Coulomb charge, 2.4 N-body zoom, 2.5 N-body cap, 2.1 overlay order (or turn `show_fft` off).
+2. ~~Quick correctness fixes: 2.3 damping, 2.7 `K[0,0] = 0`, 2.2 Coulomb charge, 2.4 N-body zoom, 2.5 N-body cap, 2.1 overlay order.~~ **Done** on branch `fix/quick-correctness`. That branch also fixed the minimap's size when `RENDER_CELL_SIZE ≠ 1` and the point-reflection mirroring. Still open in 2.1: redundant FFTs (3.3) and antialiasing.
 3. XPU option A, to get the app running on this laptop.
 4. Install MSVC Build Tools and move to option B (Triton fused particle kernel). Benchmark against §5.3.
 5. Boundary model (2.8), pressure form (2.9), units and parity (2.11), and a small physics test suite.
