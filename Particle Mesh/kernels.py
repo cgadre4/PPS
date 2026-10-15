@@ -2,16 +2,18 @@
 Particle-kernel backend selection.
 
 Both backends expose the same methods, used by the PM solver, the engine and the renderers:
-    prepare(pos, n, cell_size, grid_w, grid_h, periodic)        -> stencil shared by deposit + gather (or None)
-    deposit(stencil, pos, mass, n, density, cell_size, periodic)
+    prepare(pos, n, cell_size, grid_w, grid_h, periodic)        -> stencil shared by deposit + gather
+    deposit(stencil, pos, mass, n, density, cell_size, periodic)   overwrites density (H, W) with the CIC deposit
+    force_buffers(grid_h, grid_w, device)                        -> (fx, fy) tensors the field solver writes into
     gather_integrate(stencil, pos, vel, mass, n, fx, fy, cell_size, dt, damping, use_charge,
-                     periodic, universe_w, universe_h, accel_x=None, accel_y=None)
+                     periodic, universe_w, universe_h, accel_x=None, accel_y=None, uniform_accel=(0, 0))
     wrap(pos, n, universe_w, universe_h)
     splat_view(pos, n, cam_x, cam_y, zoom, view_w, view_h, render_cell_size) -> integer counts (view_w, view_h),
                                                                                 x-major (GGUI [x, y] layout)
 
 "taichi": Taichi kernels on shared memory (torch CUDA + Taichi CUDA, or torch CPU + Taichi CPU). Fastest there.
-"torch":  pure PyTorch on the torch device. Used for Intel XPU, where Taichi (Vulkan) cannot see torch memory.
+"torch":  pure PyTorch on the torch device (fused grid_sample CIC). Used for Intel XPU, where Taichi (Vulkan)
+          cannot see torch memory.
 """
 import taichi as ti
 import torch
@@ -73,10 +75,13 @@ class TorchBackend:
     def deposit(self, stencil, pos, mass, n, density, cell_size, periodic):
         self._deposit(stencil, mass, n, density)
 
+    def force_buffers(self, grid_h, grid_w, device):
+        return KT.force_buffers(grid_h, grid_w, device)
+
     def gather_integrate(self, stencil, pos, vel, mass, n, fx, fy, cell_size, dt, damping, use_charge,
-                         periodic, universe_w, universe_h, accel_x=None, accel_y=None):
+                         periodic, universe_w, universe_h, accel_x=None, accel_y=None, uniform_accel=(0.0, 0.0)):
         self._gather(stencil, pos, vel, mass, n, fx, fy, dt, damping, use_charge, periodic, universe_w, universe_h,
-                     accel_x, accel_y)
+                     accel_x, accel_y, uniform_accel)
 
     def wrap(self, pos, n, universe_w, universe_h):
         KT.wrap_positions(pos, n, universe_w, universe_h)
@@ -93,10 +98,15 @@ class TaichiBackend:
 
     def deposit(self, stencil, pos, mass, n, density, cell_size, periodic):
         grid_w, grid_h = stencil
+        density.zero_()
         KTI.deposit_kernel(pos, mass, density, n, grid_w, grid_h, float(cell_size), int(periodic))
 
+    def force_buffers(self, grid_h, grid_w, device):
+        # Taichi kernels need contiguous ndarrays
+        return (torch.zeros((grid_h, grid_w), device=device), torch.zeros((grid_h, grid_w), device=device))
+
     def gather_integrate(self, stencil, pos, vel, mass, n, fx, fy, cell_size, dt, damping, use_charge,
-                         periodic, universe_w, universe_h, accel_x=None, accel_y=None):
+                         periodic, universe_w, universe_h, accel_x=None, accel_y=None, uniform_accel=(0.0, 0.0)):
         grid_w, grid_h = stencil
         has_accel = accel_x is not None
         if not has_accel:
@@ -104,7 +114,8 @@ class TaichiBackend:
             accel_x = accel_y = fx[:1, :1]
         KTI.gather_integrate_kernel(pos, vel, mass, fx, fy, accel_x, accel_y, n, grid_w, grid_h, float(cell_size),
                                     float(dt), float(damping), int(use_charge), int(periodic),
-                                    float(universe_w), float(universe_h), int(has_accel))
+                                    float(universe_w), float(universe_h), int(has_accel),
+                                    float(uniform_accel[0]), float(uniform_accel[1]))
 
     def wrap(self, pos, n, universe_w, universe_h):
         KT.wrap_positions(pos, n, universe_w, universe_h)

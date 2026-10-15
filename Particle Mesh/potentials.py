@@ -1,6 +1,8 @@
 import torch
 import math
 
+from grid_ops import neg_gradient
+
 
 class PotentialsManager:
     def __init__(self, grid_w, grid_h, cell_size, device):
@@ -80,11 +82,11 @@ class PotentialsManager:
         K_k[0, 0] = 0.0
         return K_k
 
-    def compute_pressure_forces(self, density, pressure_strength, gamma, periodic, density_floor):
+    def compute_pressure_forces(self, density, pressure_strength, gamma, periodic, density_floor, out_x, out_y):
         """
-        Polytropic gas pressure acceleration a = -grad(P) / rho with P = K * rho^gamma (AUDIT 2.9).
-        For gamma = 1 (isothermal) this is -K * grad(ln rho): it depends on the density *profile*, not its amplitude,
-        so dense clumps no longer get explosive kicks.
+        Polytropic gas pressure acceleration a = -grad(P) / rho with P = K * rho^gamma (AUDIT 2.9), written into
+        out_x / out_y. For gamma = 1 (isothermal) this is -K * grad(ln rho): it depends on the density *profile*,
+        not its amplitude, so dense clumps no longer get explosive kicks.
 
         density: smoothed number density per unit area (H, W), >= 0
         pressure_strength: K
@@ -92,20 +94,14 @@ class PotentialsManager:
         density_floor: rho used in the denominator is at least this (keeps near-empty cells finite)
         """
         if pressure_strength <= 1e-5:
-            return torch.zeros_like(density), torch.zeros_like(density)
+            out_x.zero_()
+            out_y.zero_()
+            return out_x, out_y
 
-        p = density ** gamma
-        if periodic:
-            inv_2dx = 0.5 / self.cell_size
-            grad_px = (torch.roll(p, -1, dims=1) - torch.roll(p, 1, dims=1)).mul_(inv_2dx)
-            grad_py = (torch.roll(p, -1, dims=0) - torch.roll(p, 1, dims=0)).mul_(inv_2dx)
-        else:
-            grad_py, grad_px = torch.gradient(p)
-            grad_px.div_(self.cell_size)
-            grad_py.div_(self.cell_size)
-
-        scale = -pressure_strength / density.clamp(min=density_floor)
-        return grad_px.mul_(scale), grad_py.mul_(scale)
+        p = density if gamma == 1.0 else density ** gamma          # no pow pass when isothermal (AUDIT §8 F22)
+        neg_gradient(p, out_x, out_y, self.cell_size, periodic)    # -grad(P / K), slices (no roll copies)
+        scale = density.clamp(min=density_floor).reciprocal_().mul_(pressure_strength)
+        return out_x.mul_(scale), out_y.mul_(scale)
 
     def get_uniform_gravity_forces(self, magnitude, angle_deg):
         """

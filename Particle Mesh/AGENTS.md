@@ -59,15 +59,15 @@ Taichi 1.7.4 has no XPU backend. On Vulkan it copies every non-CPU tensor argume
 
 | Particles | Step | Render + present | Total |
 |---|---|---|---|
-| 1M | 10.5–12 ms | 4.7–7.5 ms | ~15–19 ms (~50–65 FPS) |
-| 2M | 17.4–22 ms | 6.2–9.6 ms | ~24–31 ms (~32–42 FPS) |
-| 4M | 32–38 ms | 9–12 ms | ~42–50 ms (~20–24 FPS) |
+| 1M | ~6.0–6.2 ms | ~2.1 ms | ~8.1–8.3 ms (~120 FPS, the app's cap) |
+| 4M | ~16.2–16.5 ms | ~4.8–5.0 ms | ~21.2–21.3 ms (~47 FPS) |
+| Painting (spawn 20k/frame at ~1.5M) | | | ~7.9 ms (was 24 ms with the second solve) |
 
 The ranges are thermal and power state. The same commit measured ~15 ms at 1M on a cool machine and ~19 ms after sustained load. Always A/B performance changes back to back (for example against a `git worktree` of `master`), never against numbers in this file.
 
 Where the time goes at 1M:
-- **Step:** FFT and forces ~6.6 ms; building the CIC stencil ~3.4 ms; gather ~2.3 ms; deposit ~1 ms.
-- **Render:** ~3.1–3.2 ms at 1M since the packed-RGBA8 present (was 6.6–8.2 ms): splat, count-LUT colour, one 5.2 MB readback, GGUI upload.
+- **Step:** FFT solve ~3.3 ms (rfft2 1.0, ×K 0.36, irfft2 1.1, slice differences 1.2); fused CIC ~1.9 ms (sampler coordinates 0.2, deposit 0.7, halo 0.6, gather 0.4); integrate and wrap ~0.5 ms.
+- **Render:** ~2.1–3.2 ms at 1M: splat, count-LUT colour, one 5.2 MB readback, GGUI upload.
 
 The next speed-up is fused Triton kernels / `torch.compile` (`AUDIT.md` §5.4 option B). That needs MSVC Build Tools; then set `TORCH_COMPILE: true`. Without a compiler it prints one notice and stays eager.
 
@@ -77,7 +77,8 @@ The next speed-up is fused Triton kernels / `torch.compile` (`AUDIT.md` §5.4 op
 - `simulation`:
   - `SOLVER` (`"pm"` or `"nbody"`; chosen at startup only, there is no runtime switch).
   - `TAICHI_BACKEND`, `KERNEL_BACKEND` (`"auto"`/`"torch"`/`"taichi"`), `TORCH_COMPILE`.
-  - `SORT_INTERVAL`: re-sort particles by grid cell every N PM steps; 0 disables.
+  - `SORT_INTERVAL`: re-sort particles by grid tile every N PM steps; 0 disables.
+  - `FIELD_INTERVAL`: opt-in multi-rate PM. Rebuild the field (deposit + FFT) every N steps and reuse it in between; spawns and erases force a rebuild. Default 1.
   - `NBODY_MAX_PARTICLES`, grid size, `PHYSICS_CELL_SIZE`, `RENDER_CELL_SIZE`, particle limits, log-density colour range.
   - The checked-in values are sized for the B390: 2048² grid, 4M max particles, 1M at startup. The 2048² float32 grid is 16 MB, which fits the 16 MB last-level cache; 4096² makes CIC ~9× slower per particle.
 - `sliders`: every entry is `[min, max, default]`. `engine.py` reads index `[2]` for defaults; `gui.py` reads `[0]`/`[1]` for slider bounds. A new tunable parameter should follow this convention.
@@ -92,24 +93,27 @@ Frame loop (`main.py`): input handling -> brush spawn/erase -> `engine.step(dt)`
   - The GUI and `main.py` mutate engine attributes directly; there is no setter layer.
 - **Boundaries.**
   - `periodic` (default): the universe is a torus, matching the FFT solver. Positions are wrapped right after each drift (inside the gather kernel for PM, `kernels.wrap` for N-body), so particles are never deleted at the edges. CIC deposit/gather wrap their neighbour indices, and N-body uses minimum-image displacements.
-  - `reflective_walls`: clamps positions and bounces velocities in `engine.step`; CIC clamps instead of wrapping.
+  - `reflective_walls`: clamps positions and bounces velocities in `engine.step`. CIC clamps instead of wrapping (edge-replicated halo; Taichi clamps to `[0, W-1]`).
 - **Particle kernels (`kernels.py`)** have one interface with two implementations:
-  - `kernels_torch.py`: pure PyTorch, any device. It builds a `CICStencil` (corner indices + weights) once per step and shares it between deposit and gather; that sharing is the biggest eager-mode saving.
+  - `kernels_torch.py`: pure PyTorch, any device. CIC uses the fused bilinear sampler on a one-cell-padded grid: gather = `grid_sample`, deposit = `aten::grid_sampler_2d_backward` with the masses as the gradient. The halo wraps (periodic) or replicates the edge (clamped).
+    - The `CICStencil` is just the normalised sampler coordinates (one `addcmul`), shared by deposit and gather.
+    - The solver writes forces straight into the padded buffer's interiors (`force_buffers`), so the gather only refreshes the halo.
+    - Measured 6.5 → 1.9 ms at 1M and 24.6 → 6.3 ms at 4M against the old 4-index stencil.
   - `kernels_taichi.py`: Taichi kernels on shared memory.
-  - Methods: `prepare`, `deposit`, `gather_integrate`, `wrap`, `splat_view`.
+  - Methods: `prepare`, `deposit` (**overwrites** the target grid), `force_buffers`, `gather_integrate` (with optional charge-free `accel_x/accel_y` and `uniform_accel`), `wrap`, `splat_view`.
   - `test_parity`-style checks (same inputs through both backends on Taichi's CPU arch) are how to validate changes to either.
-- **Sorting:** `SimulationEngine.sort_particles()` reorders particles by physics cell every `SORT_INTERVAL` PM steps. Memory-coherent scatter/gather is 2-4× faster.
+- **Sorting:** `SimulationEngine.sort_particles()` reorders particles by grid tile every `SORT_INTERVAL` PM steps (memory-coherent scatter/gather is 2-4× faster). Keys are int16 tile indices (8×8 cells on 2048²; `sort_keys()`). The permutation is gathered into swap buffers and `pos`/`vel`/`masses` are swapped, so never cache those tensors across a step. Sorting is deferred while spawned disks await orbit speeds.
 - **`masses` doubles as charge.**
   - It is 1 for every particle except in Coulomb mode. There the GUI randomises it to +/-1, and new spawns get random +/-1 (`SimulationEngine._new_masses`). Switching potential resets it.
   - In Coulomb mode the PM gather scales each particle's force by its own charge (`use_charge`).
 - **Friction** is applied as `exp(-friction * dt)`, computed on the host, so it can never flip a velocity's sign.
 - **PM solver (`pm_solver.py`)**, per step:
-  1. `kernels.prepare` → `kernels.deposit` onto `density_grid`.
+  1. `kernels.prepare` → `kernels.deposit` (overwrites `density_grid`).
   2. `rfft2` (kept as `rho_k`, which the FFT minimap and bandpass view reuse with no extra FFT).
-  3. Multiply by the cached `K_eff = K_k * Gaussian softening`, then `irfft2` to `phi`.
-  4. Central-difference `fx`/`fy`: `torch.roll` when periodic, `torch.gradient` otherwise.
-  5. Optional pressure forces.
-  6. `kernels.gather_integrate`: kick, drift, wrap.
+  3. Multiply by the cached `K_eff = K_k * Gaussian softening / N`, then `irfft2(norm='forward')` to `phi`. The 1/N lives in `K_eff`, saving a normalisation pass.
+  4. `grid_ops.neg_gradient` writes central differences by slicing straight into `fx`/`fy` (wrapped edges when periodic, one-sided otherwise).
+  5. `before_gather` hook (spawned-disk orbit speeds), then optional pressure forces.
+  6. `kernels.gather_integrate`: kick (forces, charge, pressure, uniform gravity), drift, wrap. With `FIELD_INTERVAL` > 1, steps that don't rebuild the field skip 1–5.
   
   `phi`, `fx`, `fy` and `density_grid` are kept on the solver and read by the renderer.
 - **Units and force laws (shared by both solvers; `tests/test_physics_units.py` checks PM vs N-body parity):**
@@ -118,7 +122,9 @@ Frame loop (`main.py`): input handling -> brush spawn/erase -> `engine.step(dt)`
   - Lennard-Jones and harmonic PM kernels are FFTs of a sampled `V(r)` and need no area factor.
   - Pressure is `a = -∇P/ρ`, `P = K·ρ^γ`, on a Gaussian-smoothed number density per unit area with a density floor. In Coulomb mode, pressure uses a separate `|mass|` deposit and is gathered without the charge factor (`accel_x/accel_y`).
   - Spawned gravity disks get their circular speed from the field they actually feel: `v = vel_mult · sqrt(r · a_inward)`.
-    - The acceleration comes from `pm_solver.accelerations_at` (a field-only solve, bilinear-sampled, which equals CIC) or from the N-body solver, so it includes the disk itself, existing particles, softening, screening and periodic images.
+    - `add_galaxy` queues the disk in `_pending_orbits`. The next `step()` sets the speeds from that step's own field, via `pm_solver.sample_forces` (bilinear, which equals CIC) or the N-body accelerations, so spawning costs no extra solve.
+    - Erasing before the next step flushes the queue with a separate field evaluation (`_flush_pending_orbits`).
+    - The field includes the disk itself, existing particles, softening, screening and periodic images.
     - `vel_mult` is the "Spawn Velocity (x orbit)" slider (1 = circular). Disks hold their radius to within 0.5% over 2 s.
     - Other potentials get a thermal spread of `THERMAL_SPEED·vel_mult`.
   - Default G is 0.64, retuned so the default PM scene keeps its pre-fix strength at `PHYSICS_CELL_SIZE: 2`.
@@ -126,7 +132,7 @@ Frame loop (`main.py`): input handling -> brush spawn/erase -> `engine.step(dt)`
   - `potentials.py` `PotentialsManager.get_fourier_kernel` builds `K_k`: gravity/Coulomb analytically as screened Yukawa `-+G/(k^2 + 1/range^2)`, harmonic/LJ by FFT of a real-space periodic potential on the full grid.
   - `K_k[0, 0]` is always zeroed, so phi has zero mean. Don't remove that: the mean term destroys float32 precision in phi.
   - The PM solver only rebuilds `K_k` when the potential *type* changes. Any change to a kernel parameter (G, force range, spring_k, epsilon, sigma) must trigger a rebuild: `engine.request_kernel_rebuild()` (debounced; what the GUI sliders use) or `engine.precompute_kernel()` (immediate).
-  - `K_eff` is rebuilt automatically when `K_k` or the softening length changes.
+  - `K_eff` is rebuilt automatically when `K_k` (tracked by a version counter, not `id()`) or the softening length changes.
   - Kernels and `k_sq` are stored in **rfft2 half-spectrum layout** `(H, W//2+1)`. Gravity/Coulomb `K_k` is real; harmonic/LJ is the complex `rfft2` of `V(r)`. `pm_solver.k_sq` is the same tensor as `pot_manager.k_sq`. The real-space distance grid is built on demand only.
   - GUI sliders call `engine.request_kernel_rebuild()`, which is debounced: the rebuild runs in `step()` once the value has been still for `KERNEL_REBUILD_DELAY` (0.15 s). Call `precompute_kernel()` directly when an immediate rebuild is needed (e.g. switching potential).
 - **N-body solver (`nbody_solver.py`)** computes exact pairwise accelerations in PyTorch (any device), processing targets in row tiles of `TILE_ELEMENTS` against all sources, so memory is O(N·tile). Integration happens in `engine.step`.
