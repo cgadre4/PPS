@@ -22,7 +22,7 @@ Severity: **High** = wrong results, crash, or a feature that silently does nothi
 | 6 | High | Mouse-wheel zoom and brush resize are dead code: Taichi 1.7.4 GGUI emits no wheel events. **Verified in source.** | `main.py:166-172` | Open |
 | 7 | Medium | The k=0 (mean) mode of the potential isn't zeroed. That adds a huge constant to φ, which wrecks float32 precision at large force range and washes out the potential view. | `potentials.py:39-47,79-88` | Done (PR #1) |
 | 8 | Medium | Forces are periodic (FFT) but particles are deleted at the edges, not wrapped. Mass near one edge pulls particles at the opposite edge. The GUI calls this mode "UNIVERSE WRAPPED". | `engine.py:198-206`, `gui.py:113` | Done (PR #3) |
-| 9 | Medium | Pressure is applied as acceleration `-P∇ρ^γ` rather than `-∇P/ρ`, so it explodes in dense regions. | `potentials.py:106-115` | Open |
+| 9 | Medium | Pressure is applied as acceleration `-P∇ρ^γ` rather than `-∇P/ρ`, so it explodes in dense regions. | `potentials.py:106-115` | Done (PR #5) |
 | 10 | Medium | Potential, field and bandpass views are wrong whenever `RENDER_CELL_SIZE ≠ 1` (the local `config.json` uses 2). | `main.py:283-296,380-381` | Done (PR #1, #2) |
 | 11 | Medium | Particle data is read 3–4 times per frame plus a GPU sync. At 100M particles that is about 6–7 GB of memory traffic per frame. | `engine.py:199-206`, `pm_solver.py`, `mesh_renderer.py:37-46` | Partial (PR #3): sync removed, cell sorting and a shared CIC stencil added; the single fused kernel is option B |
 | 12 | Medium | About 1 GB of redundant precomputed grids, and the kernel is stored as full complex when only half is used. | `potentials.py:12-25`, `pm_solver.py:69-74` | Partial (PR #3): softened kernel cached; duplicate grids and full-complex `K_k` remain |
@@ -96,6 +96,8 @@ Pick one model:
 The current hybrid is neither. At minimum, rename the "UNIVERSE WRAPPED" button.
 
 ### 2.9 Pressure force has the wrong form (Medium)
+**Fixed** (PR #5): `a = -∇P/ρ` on a Gaussian-smoothed number density per unit area, with a density floor. In Coulomb mode it uses a separate `|mass|` deposit and is gathered without the charge factor. Measured: a 100× denser clump of the same shape gets a 1.11× push (before, ~100×).
+
 `compute_pressure_forces` returns `-P·∇(ρ^γ)` and adds it straight to the acceleration field. Physically, acceleration is `-∇P/ρ = -K·γ·ρ^(γ-2)·∇ρ`. For isothermal gas (γ = 1) that is `-K·∇ln ρ`. The current form scales with the local density, so dense clumps get enormous kicks while diffuse gas gets almost none.
 
 The raw CIC density is also noisy (shot noise), and its gradient is noisier still.
@@ -112,12 +114,24 @@ The minimap size (`main.py:380-381`) is also in pixels but is written into a ren
 **Fix:** `world_gx = (screen_x + 0.5) * RENDER_CELL_SIZE / zoom + cam_x` (same for y), and divide the minimap size by `RENDER_CELL_SIZE`.
 
 ### 2.11 PM and N-body don't match for the same slider values (Low/Medium)
+**Fixed** (PR #5):
+- Both solvers use `|a| = G·m/r`. The PM kernel is `-2πG/(k²+λ²)/cell_size²`.
+- Harmonic uses 1/N mean-field scaling in both solvers.
+- The softening slider is relabelled "Force Softening Length".
+- Measured PM vs N-body: gravity and Coulomb within 0.7%, harmonic within 0.2%.
+- Default G is retuned from 1.0 to 0.64, keeping the default PM scene's strength.
+
 - **Gravity/Coulomb:** PM solves ∇²φ = Gρ, giving `|g| = G·M/(2π r)`. N-body uses `G·m·dx/r²`, giving `|g| = G·M/r`. The same G is therefore 2π stronger in N-body.
 - **Harmonic:** N-body divides by N (`nbody_solver.py:57`); PM does not.
 - **Units:** PM deposits mass per cell, not per unit area, so changing `PHYSICS_CELL_SIZE` silently rescales every force by `cell_size²`. Divide `density_grid` by `cell_size**2`.
 - **Softening:** the GUI calls it "Plummer" (`gui.py:125`), but PM uses a Gaussian `exp(-k²s²/2)`. Only N-body is Plummer.
 
 ### 2.12 Spawned galaxies aren't in equilibrium (Low)
+**Fixed** (PR #5):
+- Spawn speeds are `sqrt(G·M(<r)·(κr)K₁(κr))`, which includes the force-range screening.
+- The spawn-velocity slider is now a multiple of the orbit speed: range −2…2, default 1.
+- Measured: a 200k-particle disk keeps its median radius within 7% over 1 s (+20% by 2 s, from the screening approximation). At rest it collapses to 39%.
+
 `orbital_speed = sqrt(|G|·100/(r+10))` (`engine.py:131`) is an arbitrary profile. For the 2D PM law, the circular speed is `v² = G·M(<r)/(2π)`. For the "dense core" distribution (r uniform), M(<r) = count·r/R, so `v = sqrt(G·count·r/(2π·R))` (divided by cell_size² once 2.11 is fixed). The current formula makes disks either fly apart or collapse depending on brush size and density. `spawn_vel` then multiplies whatever the result is.
 
 ### 2.13 Smaller issues

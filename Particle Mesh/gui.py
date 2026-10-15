@@ -122,7 +122,8 @@ class SimulationGUI:
         self.engine.friction = self.friction_val
         
         # Force Softening
-        self.softening_val = gui.slider_float("Force Softening (Plummer)", self.softening_val, self.config["sliders"]["softening_length"][0], self.config["sliders"]["softening_length"][1])
+        # Softening length in world units: Gaussian filter in PM mode, Plummer epsilon in N-body mode
+        self.softening_val = gui.slider_float("Force Softening Length", self.softening_val, self.config["sliders"]["softening_length"][0], self.config["sliders"]["softening_length"][1])
         self.engine.softening_length = self.softening_val
         
         # Time Scale Log
@@ -165,7 +166,9 @@ class SimulationGUI:
         gui.text("")
         gui.text("--- SPAWNER BRUSH ---")
         interaction_radius = gui.slider_float("Brush Radius", interaction_radius, self.config["sliders"]["brush_radius"][0], self.config["sliders"]["brush_radius"][1])
-        spawn_vel = gui.slider_float("Spawn Velocity (CW)", spawn_vel, self.config["sliders"]["spawn_velocity"][0], self.config["sliders"]["spawn_velocity"][1])
+        # Gravity: multiple of the circular orbit speed (1 = equilibrium disk, negative = counter-rotating).
+        # Other potentials: thermal speed multiplier.
+        spawn_vel = gui.slider_float("Spawn Velocity (x orbit)", spawn_vel, self.config["sliders"]["spawn_velocity"][0], self.config["sliders"]["spawn_velocity"][1])
         spawn_density = gui.slider_float("Density (stars/px^2)", spawn_density, self.config["sliders"]["spawn_density"][0], self.config["sliders"]["spawn_density"][1])
         
         spawn_type_text = "Uniform Disk" if self.engine.uniform_spawn else "Dense Core"

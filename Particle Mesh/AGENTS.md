@@ -105,6 +105,13 @@ Frame loop (`main.py`): input handling -> brush spawn/erase -> `engine.step(dt)`
   6. `kernels.gather_integrate`: kick, drift, wrap.
   
   `phi`, `fx`, `fy` and `density_grid` are kept on the solver and read by the renderer.
+- **Units and force laws (shared by both solvers; `tests/test_physics_units.py` checks PM vs N-body parity):**
+  - Gravity and Coulomb follow the 2D law `|a| = G·m/r`. PM solves `lap(phi) = 2π·G·ρ_area`; the deposited mass per cell is divided by `cell_size²` inside the kernel (`area_scale` in `potentials.py`). N-body uses `G·m·dx/(r² + ε²)`.
+  - Harmonic springs use mean-field scaling (force per unit total mass, i.e. ÷N) in both solvers.
+  - Lennard-Jones and harmonic PM kernels are FFTs of a sampled `V(r)` and need no area factor.
+  - Pressure is `a = -∇P/ρ`, `P = K·ρ^γ`, on a Gaussian-smoothed number density per unit area with a density floor. In Coulomb mode, pressure uses a separate `|mass|` deposit and is gathered without the charge factor (`accel_x/accel_y`).
+  - Spawned gravity disks get `v = vel_mult · sqrt(G·M(<r)·(κr)K₁(κr))`, where `κ = 1/force_range` and `vel_mult` is the "Spawn Velocity (x orbit)" slider (1 = circular). Other potentials get a thermal spread of `THERMAL_SPEED·vel_mult`.
+  - Default G is 0.64, retuned so the default PM scene keeps its pre-fix strength at `PHYSICS_CELL_SIZE: 2`.
 - **Kernel caching:**
   - `potentials.py` `PotentialsManager.get_fourier_kernel` builds `K_k`: gravity/Coulomb analytically as screened Yukawa `-+G/(k^2 + 1/range^2)`, harmonic/LJ by FFT of a real-space periodic potential on the full grid.
   - `K_k[0, 0]` is always zeroed, so phi has zero mean. Don't remove that: the mean term destroys float32 precision in phi.
@@ -140,9 +147,7 @@ All image math runs in PyTorch on the simulation device; Taichi only receives fi
 
 ## Known issues
 
-`AUDIT.md` lists verified bugs, performance problems and the XPU plan, in a suggested fix order (§6). Check it before changing physics or rendering code. Notably still open:
-- PM vs N-body force-strength mismatch for the same G (2π and `cell_size²` factors; §2.11);
-- the pressure-force form (§2.9).
+`AUDIT.md` lists verified bugs, performance problems and the XPU plan, with a Status column and a suggested fix order (§6). Check it before changing physics or rendering code.
 
 ## Legacy code
 

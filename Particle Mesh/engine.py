@@ -20,6 +20,8 @@ PHYSICS_GRID_W = CONFIG["simulation"].get("PHYSICS_GRID_W", 7680)
 PHYSICS_GRID_H = CONFIG["simulation"].get("PHYSICS_GRID_H", 7680)
 PHYSICS_CELL_SIZE = CONFIG["simulation"]["PHYSICS_CELL_SIZE"]
 MAX_PARTICLES = CONFIG["simulation"]["MAX_PARTICLES"]
+# Thermal spawn velocity spread for non-gravity potentials (at spawn_velocity = 1)
+THERMAL_SPEED = 1250.0
 # Direct N-body allocates ~10 dense N x N float32 tensors per step (~4 GB at N = 10,000)
 NBODY_MAX_PARTICLES = CONFIG["simulation"].get("NBODY_MAX_PARTICLES", 10000)
 
@@ -165,6 +167,20 @@ class SimulationEngine:
             return torch.randint(0, 2, (count,), device=self.device, dtype=torch.int8) * 2 - 1
         return torch.ones(count, device=self.device, dtype=torch.int8)
 
+    def _circular_speed(self, r, world_radius, count):
+        """
+        Circular orbit speed for a freshly spawned disk of `count` unit masses (AUDIT 2.12).
+        Both solvers use the 2D law |a| = G*M/r, so v^2 = G * M(<r): M(<r) = count * r/R for the "dense core"
+        (r uniform) and count * (r/R)^2 for the uniform disk. The force-range (Yukawa) screening of the PM
+        kernel weakens a point mass's pull by (kappa*r) * K1(kappa*r), kappa = 1/range; applying that factor to
+        the enclosed mass is an approximation that keeps disks close to equilibrium at short ranges too.
+        """
+        frac = r / max(world_radius, 1e-6)
+        m_enc = count * (frac * frac if self.uniform_spawn else frac)
+        x = (r / self.gravity_range).clamp_(min=1e-6)
+        screening = x * torch.special.modified_bessel_k1(x)
+        return torch.sqrt(abs(self.G) * m_enc * screening)
+
     def add_galaxy(self, world_x, world_y, world_radius, count=5000, vel_mult=0.0):
         count = int(count)
         capacity = self.capacity()
@@ -185,13 +201,13 @@ class SimulationEngine:
         new_pos[:, 1] = world_y + r * torch.sin(theta)
         
         if self.potential_type == 'gravity':
-            orbital_speed = torch.sqrt(abs(self.G) * 100.0 / (r + 10.0))
+            orbital_speed = self._circular_speed(r, world_radius, count) * vel_mult
             new_vel = torch.zeros((count, 2), device=self.device)
-            new_vel[:, 0] = torch.sin(theta) * orbital_speed * vel_mult
-            new_vel[:, 1] = -torch.cos(theta) * orbital_speed * vel_mult
+            new_vel[:, 0] = torch.sin(theta) * orbital_speed
+            new_vel[:, 1] = -torch.cos(theta) * orbital_speed
         else:
-            # Thermal coordinates setup
-            new_vel = (torch.rand((count, 2), device=self.device) - 0.5) * 50.0 * vel_mult
+            # Thermal velocities; vel_mult = 1 (the slider default) gives the same spread as before
+            new_vel = (torch.rand((count, 2), device=self.device) - 0.5) * THERMAL_SPEED * vel_mult
             
         start, end = self.num_active, self.num_active + count
         self.pos[start:end] = new_pos
