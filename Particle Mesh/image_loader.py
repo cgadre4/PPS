@@ -88,6 +88,8 @@ def load_image_particles(file_path, cam_x, cam_y, zoom, spawn_density, width, he
         
         total_spawn = int(np.sum(counts_to_spawn))
         if total_spawn == 0:
+            print(f"[image_loader] '{os.path.basename(file_path)}' produced no particles "
+                  "(too dark, outside the universe, or spawn density too low)")
             return None
             
         screen_cols = col_start + np.repeat(c_indices, counts_to_spawn)

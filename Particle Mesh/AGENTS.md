@@ -42,7 +42,11 @@ uv run python main.py
 - **Headless technique:** wrap `ti.ui.Window` with `show_window=False`, stub the input methods, and read `get_image_buffer_as_numpy()`. Don't call `window.show()` without a visible window; it crashes. GGUI supports one window per process.
 - There is no build step or linter.
 - Don't set `PYTORCH_CUDA_ALLOC_CONF`/expandable segments for non-CUDA builds. PyTorch applies it to XPU too, and it measured ~15-20% slower (`main.py` only sets it when `torch.version.cuda`).
-- In `nbody` mode, `simulation.NBODY_MAX_PARTICLES` (default 10,000) caps both the startup count and brush/image spawning (`SimulationEngine.capacity()`), because the solver builds dense N×N tensors (~4 GB at 10k).
+- In `nbody` mode, `simulation.NBODY_MAX_PARTICLES` (default 10,000) caps both the startup count and brush/image spawning (`SimulationEngine.capacity()`).
+  - The solver is tiled (`TILE_ELEMENTS` per tile), so memory stays ~0.13 GiB at any N.
+  - The limit is O(N²) speed: on the B390, 10k ≈ 146 ms/step and 20k ≈ 630 ms. Raise the cap on bigger GPUs.
+- `config.py` is the only module that reads `config.json`; import `CONFIG` from it.
+- Mouse-wheel input doesn't exist in Taichi 1.7 GGUI. Zoom and brush size use Z+drag and the arrow keys.
 
 ### Intel XPU rule: never pass XPU tensors to Taichi kernels
 
@@ -54,9 +58,11 @@ Taichi 1.7.4 has no XPU backend. On Vulkan it copies every non-CPU tensor argume
 
 | Particles | Step | Render + present | Total |
 |---|---|---|---|
-| 1M | 11.6 ms | 5.5 ms | ~59 FPS |
-| 2M | 18.8 ms | 6.3 ms | ~40 FPS |
-| 4M | 33.0 ms | 8.7 ms | ~24 FPS |
+| 1M | 10.5–12 ms | 4.7–7.5 ms | ~15–19 ms (~50–65 FPS) |
+| 2M | 17.4–22 ms | 6.2–9.6 ms | ~24–31 ms (~32–42 FPS) |
+| 4M | 32–38 ms | 9–12 ms | ~42–50 ms (~20–24 FPS) |
+
+The ranges are thermal and power state. The same commit measured ~15 ms at 1M on a cool machine and ~19 ms after sustained load. Always A/B performance changes back to back (for example against a `git worktree` of `master`), never against numbers in this file.
 
 Where the time goes at 1M:
 - **Step:** FFT and forces ~6.6 ms; building the CIC stencil ~3.4 ms; gather ~2.3 ms; deposit ~1 ms.
@@ -117,6 +123,8 @@ Frame loop (`main.py`): input handling -> brush spawn/erase -> `engine.step(dt)`
   - `K_k[0, 0]` is always zeroed, so phi has zero mean. Don't remove that: the mean term destroys float32 precision in phi.
   - The PM solver only rebuilds `K_k` when the potential *type* changes. Any change to a kernel parameter (G, force range, spring_k, epsilon, sigma) must call `engine.precompute_kernel()`, as the GUI does for its sliders.
   - `K_eff` is rebuilt automatically when `K_k` or the softening length changes.
+  - Kernels and `k_sq` are stored in **rfft2 half-spectrum layout** `(H, W//2+1)`. Gravity/Coulomb `K_k` is real; harmonic/LJ is the complex `rfft2` of `V(r)`. `pm_solver.k_sq` is the same tensor as `pot_manager.k_sq`. The real-space distance grid is built on demand only.
+  - GUI sliders call `engine.request_kernel_rebuild()`, which is debounced: the rebuild runs in `step()` once the value has been still for `KERNEL_REBUILD_DELAY` (0.15 s). Call `precompute_kernel()` directly when an immediate rebuild is needed (e.g. switching potential).
 - **N-body solver (`nbody_solver.py`)** builds full NxN pairwise matrices in PyTorch (any device) and returns accelerations; integration happens in `engine.step`.
 - **Adding or changing a potential touches four places:** `potentials.get_fourier_kernel` (PM), `nbody_solver.solve` (N-body), `engine.precompute_kernel`/`step` param dicts, and the buttons/sliders in `gui.py`.
 
@@ -137,6 +145,7 @@ Frame loop (`main.py`): input handling -> brush spawn/erase -> `engine.step(dt)`
 ### Rendering
 
 All image math runs in PyTorch on the simulation device; Taichi only receives finished buffers.
+- **PM frame entry point:** `MeshRenderer.render_pm(canvas, engine, camera, color_map, ui_w)` draws the density, potential or bandpass view, the FFT minimap (`fft_thumbnail`, mask from the cached `bandpass_mask`) and the force arrows. `build_view_grid` lives in `mesh_renderer.py`, and `main.py` re-exports it.
 - **PM mode:** `MeshRenderer.render` calls `kernels.splat_view` (counts per render cell), then `colorize` (log10 through a cached 257-entry uint8 LUT per theme; empty cells black), then `_present`.
   - `_present` pastes the overlay, then does one upload into `display_pixels`, then `canvas.set_image`.
   - The potential, bandpass and vector-field views are fed by grid-sampled solver arrays instead.

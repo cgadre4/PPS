@@ -1,15 +1,9 @@
-import os
 import math
 import taichi as ti
-import json
 import torch
 
+from config import CONFIG
 from kernels import to_taichi
-
-# --- Load Config for Field Sizes ---
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
-with open(CONFIG_PATH, 'r') as f:
-    CONFIG = json.load(f)
 
 WIDTH = CONFIG["display"]["WIDTH"]
 HEIGHT = CONFIG["display"]["HEIGHT"]
@@ -67,9 +61,113 @@ def colorize(density, color_map, min_log, max_log, scale):
     return _color_lut(color_map)[idx]
 
 
+def build_view_grid(camera, universe_w, universe_h, device):
+    """
+    grid_sample coordinates that map every viewport render cell onto the physics grid.
+    Returns a (1, VIEW_H, VIEW_W, 2) tensor of normalised [-1, 1] coordinates (for align_corners=False).
+    """
+    grid_w = int(camera.width / RENDER_CELL_SIZE)
+    grid_h = int(camera.height / RENDER_CELL_SIZE)
+
+    screen_y, screen_x = torch.meshgrid(
+        torch.arange(grid_h, device=device, dtype=torch.float32),
+        torch.arange(grid_w, device=device, dtype=torch.float32),
+        indexing='ij'
+    )
+    # Render cell (gx, gy) covers screen pixels [gx, gx + 1) * RENDER_CELL_SIZE (same binning as splat_view);
+    # sample the physics grid at the world position of that cell's centre.
+    world_gx = (screen_x + 0.5) * RENDER_CELL_SIZE / camera.zoom + camera.cam_x
+    world_gy = (screen_y + 0.5) * RENDER_CELL_SIZE / camera.zoom + camera.cam_y
+
+    grid_x_norm = (world_gx / universe_w) * 2.0 - 1.0
+    grid_y_norm = (world_gy / universe_h) * 2.0 - 1.0
+    return torch.stack((grid_x_norm, grid_y_norm), dim=-1).unsqueeze(0)
+
+
+def _sample(grids, view_grid):
+    """grid_sample a (C, H, W) stack of physics grids onto the viewport -> (C, VIEW_H, VIEW_W)."""
+    return torch.nn.functional.grid_sample(grids.unsqueeze(0), view_grid, align_corners=False,
+                                           padding_mode='zeros').squeeze(0)
+
+
 class MeshRenderer:
     def __init__(self, kernels):
         self.kernels = kernels  # particle backend; provides splat_view on the sim device
+        self._bandpass = None
+        self._bandpass_key = None
+
+    def bandpass_mask(self, k_sq, inner, outer, transition):
+        """Smooth radial band-pass in |k| (rfft2 layout), cached until the sliders or the grid change."""
+        key = (id(k_sq), inner, outer, transition)
+        if self._bandpass_key != key:
+            k_mag = torch.sqrt(k_sq)
+            trans = max(transition, 0.001)
+            mask = torch.ones_like(k_mag)
+            if inner > 0.01:
+                mask *= torch.sigmoid((k_mag - inner) / trans * 4.0)
+            if outer < 4.99:
+                mask *= torch.sigmoid((outer - k_mag) / trans * 4.0)
+            self._bandpass, self._bandpass_key = mask, key
+        return self._bandpass
+
+    def fft_thumbnail(self, rho_k, mask, size):
+        """
+        Grayscale log-magnitude spectrum, size x size render cells, DC at the centre.
+        Returns an overlay tuple (uint8 tensor, width, height) for render()/render_grid().
+        """
+        thumb_half = torch.nn.functional.interpolate(
+            (torch.abs(rho_k) * mask)[None, None], size=(size, size // 2), mode='bilinear', align_corners=False
+        )[0, 0]
+        thumb_half = torch.fft.fftshift(torch.log1p(thumb_half), dim=0)
+        # Real input: |F(-kx, -ky)| = |F(kx, ky)|, so the negative-kx half is a point reflection
+        thumb = torch.cat([torch.flip(thumb_half, dims=[0, 1]), thumb_half], dim=1)
+        thumb = (thumb / (thumb.max() + 1e-5) * 255.0).to(torch.uint8)
+        return thumb.contiguous(), thumb.shape[1], size
+
+    def render_pm(self, canvas, engine, camera, color_map, ui_w):
+        """
+        Draws a full PM-mode frame: the particle density (or the potential / band-passed density view), the
+        optional FFT minimap overlay and the optional force-arrow overlay.
+        """
+        solver = engine.pm_solver
+        sim_cfg = CONFIG["simulation"]
+        rho_k = solver.rho_k  # density spectrum from this step's solve (no extra FFT)
+        mask = None
+        if rho_k is not None and (engine.show_fft or engine.use_bandpass_render):
+            mask = self.bandpass_mask(solver.k_sq, engine.bp_inner, engine.bp_outer, engine.bp_transition)
+
+        # FFT radar thumbnail, drawn into the frame before canvas.set_image() snapshots it. It spans ui_w of the
+        # window width, measured in render cells.
+        overlay = None
+        if engine.show_fft and rho_k is not None:
+            overlay = self.fft_thumbnail(rho_k, mask, int(camera.width * ui_w / RENDER_CELL_SIZE))
+
+        view_grid = None
+        if engine.show_potential or engine.use_bandpass_render or engine.show_field:
+            view_grid = build_view_grid(camera, engine.universe_w, engine.universe_h, engine.device)
+
+        if engine.show_potential:
+            view = _sample(torch.abs(solver.phi)[None], view_grid)[0].clamp_(min=0.0)
+            self.render_grid(canvas, view, color_map, engine.pot_min_log, engine.pot_max_log, 1.0, overlay=overlay)
+        elif engine.use_bandpass_render and rho_k is not None:
+            filtered = torch.fft.irfft2(rho_k * mask, s=solver.density_grid.shape)
+            view = _sample(filtered[None], view_grid)[0].clamp_(min=0.0)
+            self.render_grid(canvas, view, color_map, sim_cfg["MIN_LOG_DENSITY"], sim_cfg["MAX_LOG_DENSITY"], 1.0,
+                             overlay=overlay)
+        else:
+            self.render(canvas, engine.pos, engine.num_active, camera.cam_x, camera.cam_y, camera.zoom, color_map,
+                        sim_cfg["MIN_LOG_DENSITY"], sim_cfg["MAX_LOG_DENSITY"], sim_cfg["ZOOM_INTENSITY_SCALE"],
+                        overlay=overlay)
+
+        if engine.show_field:
+            forces = _sample(torch.stack((solver.fx, solver.fy)), view_grid)
+            disp = CONFIG["display"]
+            self.render_vectors(
+                canvas, forces[0].contiguous(), forces[1].contiguous(), color_map,
+                engine.field_min_log, engine.field_max_log,
+                disp.get("arrow_length_scale", 1.5), disp.get("arrow_head_size", 0.25),
+                disp.get("arrow_head_angle", 0.5), disp.get("arrow_width", 0.001)
+            )
 
     def render(self, canvas, pos_tensor, num_active, cam_x, cam_y, zoom, color_map_tensor, min_log, max_log, zoom_intensity_scale, overlay=None):
         """

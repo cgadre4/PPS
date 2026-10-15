@@ -10,12 +10,8 @@ if torch.version.cuda:
 
 import math
 import time
-import json
 
-# --- Load Configuration ---
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
-with open(CONFIG_PATH, 'r') as f:
-    CONFIG = json.load(f)
+from config import CONFIG
 
 # Global Display Settings
 WIDTH = CONFIG["display"]["WIDTH"]
@@ -76,7 +72,7 @@ from colors import THEMES
 from engine import SimulationEngine, NBODY_MAX_PARTICLES
 from camera import SimulationCamera
 from circle_renderer import CircleRenderer
-from mesh_renderer import MeshRenderer
+from mesh_renderer import MeshRenderer, build_view_grid  # noqa: F401  (build_view_grid re-exported for tools/tests)
 from gui import SimulationGUI
 
 # Setup GGUI Fields for brush rings and arrow signs
@@ -98,29 +94,6 @@ def update_brush_ring(center_x: ti.f32, center_y: ti.f32, radius_x: ti.f32, radi
         angle = float(i) / 64.0 * 2.0 * math.pi
         ring_pos_field[i] = [center_x + ti.cos(angle) * radius_x, center_y + ti.sin(angle) * radius_y]
 
-
-def build_view_grid(camera, universe_w, universe_h, device):
-    """
-    grid_sample coordinates that map every viewport render cell onto the physics grid.
-    Returns a (1, VIEW_H, VIEW_W, 2) tensor of normalised [-1, 1] coordinates (for align_corners=False).
-    """
-    render_cell_size = CONFIG["simulation"]["RENDER_CELL_SIZE"]
-    grid_w = int(camera.width / render_cell_size)
-    grid_h = int(camera.height / render_cell_size)
-
-    screen_y, screen_x = torch.meshgrid(
-        torch.arange(grid_h, device=device, dtype=torch.float32),
-        torch.arange(grid_w, device=device, dtype=torch.float32),
-        indexing='ij'
-    )
-    # Render cell (gx, gy) covers screen pixels [gx, gx + 1) * RENDER_CELL_SIZE (same binning as
-    # render_scatter_kernel); sample the physics grid at the world position of that cell's centre.
-    world_gx = (screen_x + 0.5) * render_cell_size / camera.zoom + camera.cam_x
-    world_gy = (screen_y + 0.5) * render_cell_size / camera.zoom + camera.cam_y
-
-    grid_x_norm = (world_gx / universe_w) * 2.0 - 1.0
-    grid_y_norm = (world_gy / universe_h) * 2.0 - 1.0
-    return torch.stack((grid_x_norm, grid_y_norm), dim=-1).unsqueeze(0)
 
 
 def main():
@@ -173,6 +146,10 @@ def main():
     circle_renderer = CircleRenderer()
     mesh_renderer = MeshRenderer(engine.kernels)
     sim_gui = SimulationGUI(engine, camera, CONFIG)
+
+    # N-body Coulomb circle colours (created once, not every frame)
+    positive_color = torch.tensor([255.0, 50.0, 50.0], device=engine.device)
+    negative_color = torch.tensor([50.0, 150.0, 255.0], device=engine.device)
 
     # Spawner Brush settings
     interaction_radius = CONFIG["sliders"]["brush_radius"][2]
@@ -248,18 +225,11 @@ def main():
         prev_r = r_pressed
         prev_m = m_pressed
 
-        # Handle mouse scroll events
+        # Key events. (Taichi 1.7 GGUI reports no mouse-wheel events, so zoom and brush size use drags/keys.)
         mouse_norm = window.get_cursor_pos()
         for e in window.get_events():
             if e.key == ti.ui.ESCAPE:
                 window.running = False
-            elif e.key == getattr(ti.ui, 'WHEEL', 'Wheel') or e.key == getattr(ti.GUI, 'WHEEL', 'Wheel'):
-                zoom_delta = e.delta[1]
-                if z_pressed:
-                    camera.zoom_around_mouse(mouse_norm[0] * WIDTH, mouse_norm[1] * HEIGHT, 1.1 if zoom_delta > 0 else (1.0 / 1.1))
-                else:
-                    interaction_radius *= 1.1 if zoom_delta > 0 else (1.0 / 1.1)
-                    interaction_radius = max(CONFIG["sliders"]["brush_radius"][0], min(CONFIG["sliders"]["brush_radius"][1], interaction_radius))
 
         # Keyboard Pan/Zoom fallbacks
         if window.is_pressed(ti.ui.UP):
@@ -343,10 +313,8 @@ def main():
             if engine.solver_type == 'nbody':
                 # Dynamically color circles based on speed/charges in PyTorch VRAM
                 if engine.potential_type == 'coulomb':
-                    charges = engine.masses[:engine.num_active]
-                    color_tensor = torch.zeros((engine.num_active, 3), dtype=torch.float32, device=engine.device)
-                    color_tensor[charges > 0] = torch.tensor([255.0, 50.0, 50.0], device=engine.device)
-                    color_tensor[charges < 0] = torch.tensor([50.0, 150.0, 255.0], device=engine.device)
+                    positive = (engine.masses[:engine.num_active] > 0).unsqueeze(1)
+                    color_tensor = torch.where(positive, positive_color, negative_color)
                 else:
                     speed = torch.norm(engine.vel[:engine.num_active], dim=1)
                     max_speed = 50.0
@@ -368,112 +336,8 @@ def main():
                 )
                 
             elif engine.solver_type == 'pm':
-                # FFT PIP radar thumbnail. It is handed to the renderer, which draws it before canvas.set_image()
-                # (set_image snapshots the frame immediately, so drawing it afterwards would never show).
-                fft_overlay = None
-                rho_k = engine.pm_solver.rho_k  # density spectrum from this step's solve (no extra FFT)
-                if engine.show_fft and rho_k is not None:
-                    k_sq_real = engine.pm_solver.k_sq[:, :rho_k.shape[1]]
-                    k_mag = torch.sqrt(k_sq_real)
-
-                    bp_trans = max(engine.bp_transition, 0.001)
-                    bandpass = torch.ones_like(k_mag)
-                    if engine.bp_inner > 0.01:
-                        bandpass *= torch.sigmoid((k_mag - engine.bp_inner) / bp_trans * 4.0)
-                    if engine.bp_outer < 4.99:
-                        bandpass *= torch.sigmoid((engine.bp_outer - k_mag) / bp_trans * 4.0)
-
-                    mag = torch.abs(rho_k) * bandpass
-                    mag_4d = mag.unsqueeze(0).unsqueeze(0)
-
-                    # Size in render cells (display_pixels resolution); on screen it spans ui_w of the window width
-                    minimap_w = int(camera.width * sim_gui.ui_w / CONFIG["simulation"]["RENDER_CELL_SIZE"])
-                    minimap_h = minimap_w
-
-                    thumb_half = torch.nn.functional.interpolate(
-                        mag_4d, size=(minimap_h, minimap_w // 2), mode='bilinear', align_corners=False
-                    ).squeeze(0).squeeze(0)
-
-                    thumb_half = torch.log1p(thumb_half)
-                    thumb_half = torch.fft.fftshift(thumb_half, dim=0)
-                    # Real input: |F(-kx, -ky)| = |F(kx, ky)|, so the negative-kx half is a point reflection
-                    thumb_full = torch.cat([torch.flip(thumb_half, dims=[0, 1]), thumb_half], dim=1)
-
-                    thumb_max = thumb_full.max() + 1e-5
-                    fft_thumb = (thumb_full / thumb_max * 255.0).to(torch.uint8)
-                    fft_overlay = (fft_thumb.contiguous(), thumb_full.shape[1], minimap_h)
-
-                # Perform grid sampling on GPU before rendering advanced views
-                if engine.show_potential or engine.use_bandpass_render or engine.show_field:
-                    grid_transform = build_view_grid(camera, engine.universe_w, engine.universe_h, engine.device)
-
-                if engine.show_potential:
-                    phi_view = torch.abs(engine.pm_solver.phi).unsqueeze(0).unsqueeze(0)
-                    view_dens = torch.nn.functional.grid_sample(
-                        phi_view, grid_transform, align_corners=False, padding_mode='zeros'
-                    ).squeeze(0).squeeze(0)
-                    view_dens = torch.clamp(view_dens, min=0.0)
-                    
-                    mesh_renderer.render_grid(
-                        canvas, view_dens, active_map,
-                        engine.pot_min_log, engine.pot_max_log, 1.0,
-                        overlay=fft_overlay
-                    )
-                elif engine.use_bandpass_render and rho_k is not None:
-                    # Filter densities on the fly
-                    k_sq_real = engine.pm_solver.k_sq[:, :rho_k.shape[1]]
-                    k_mag = torch.sqrt(k_sq_real)
-                    
-                    bp_trans = max(engine.bp_transition, 0.001)
-                    bandpass = torch.ones_like(k_mag)
-                    if engine.bp_inner > 0.01:
-                        bandpass *= torch.sigmoid((k_mag - engine.bp_inner) / bp_trans * 4.0)
-                    if engine.bp_outer < 4.99:
-                        bandpass *= torch.sigmoid((engine.bp_outer - k_mag) / bp_trans * 4.0)
-                        
-                    filtered_rho_k = rho_k * bandpass
-                    filtered_density = torch.fft.irfft2(filtered_rho_k, s=engine.pm_solver.density_grid.shape).real
-                    
-                    view_dens = torch.nn.functional.grid_sample(
-                        filtered_density.unsqueeze(0).unsqueeze(0), 
-                        grid_transform, align_corners=False, padding_mode='zeros'
-                    ).squeeze(0).squeeze(0)
-                    view_dens = torch.clamp(view_dens, min=0.0)
-                    
-                    mesh_renderer.render_grid(
-                        canvas, view_dens, active_map,
-                        CONFIG["simulation"]["MIN_LOG_DENSITY"], CONFIG["simulation"]["MAX_LOG_DENSITY"], 1.0,
-                        overlay=fft_overlay
-                    )
-                else:
-                    mesh_renderer.render(
-                        canvas,
-                        engine.pos,
-                        engine.num_active,
-                        camera.cam_x, camera.cam_y,
-                        camera.zoom,
-                        active_map,
-                        CONFIG["simulation"]["MIN_LOG_DENSITY"],
-                        CONFIG["simulation"]["MAX_LOG_DENSITY"],
-                        CONFIG["simulation"]["ZOOM_INTENSITY_SCALE"],
-                        overlay=fft_overlay
-                    )
-
-                # Overlay vector field
-                if engine.show_field:
-                    force_view = torch.stack((engine.pm_solver.fx, engine.pm_solver.fy), dim=0).unsqueeze(0)
-                    view_forces = torch.nn.functional.grid_sample(
-                        force_view, grid_transform, align_corners=False, padding_mode='zeros'
-                    ).squeeze(0)
-                    
-                    mesh_renderer.render_vectors(
-                        canvas, view_forces[0].contiguous(), view_forces[1].contiguous(), active_map,
-                        engine.field_min_log, engine.field_max_log,
-                        CONFIG["display"].get("arrow_length_scale", 1.5),
-                        CONFIG["display"].get("arrow_head_size", 0.25),
-                        CONFIG["display"].get("arrow_head_angle", 0.5),
-                        CONFIG["display"].get("arrow_width", 0.001)
-                    )
+                # Density / potential / band-pass view, FFT minimap and force arrows (see MeshRenderer.render_pm)
+                mesh_renderer.render_pm(canvas, engine, camera, active_map, sim_gui.ui_w)
 
         # Draw brush ring overlay
         update_brush_ring(mouse_norm[0], mouse_norm[1], interaction_radius / float(WIDTH), interaction_radius / float(HEIGHT))

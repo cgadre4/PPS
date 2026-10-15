@@ -1,13 +1,8 @@
-import os
-import json
 import taichi as ti
 import torch
 
+from config import CONFIG
 from kernels import to_taichi
-
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
-with open(CONFIG_PATH, 'r') as f:
-    CONFIG = json.load(f)
 
 # --- TAICHI RENDER FIELDS (GGUI vertex buffers) ---
 # Only N-body mode draws circles, and it is capped at NBODY_MAX_PARTICLES, so size the buffers to that

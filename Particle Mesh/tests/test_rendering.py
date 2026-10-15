@@ -3,8 +3,6 @@
 import pytest
 import torch
 
-import engine as E
-import main
 import mesh_renderer as MR
 from camera import SimulationCamera
 
@@ -52,7 +50,7 @@ def test_view_grid_aligns_with_particle_view(make_engine, zoom, frac):
     jj, ii = torch.meshgrid(torch.arange(gh, device=eng.device, dtype=torch.float32),
                             torch.arange(gw, device=eng.device, dtype=torch.float32), indexing='ij')
     blob = torch.exp(-((ii - i) ** 2 + (jj - j) ** 2) / (2 * 3.0 ** 2))
-    grid = main.build_view_grid(cam, eng.universe_w, eng.universe_h, eng.device)
+    grid = MR.build_view_grid(cam, eng.universe_w, eng.universe_h, eng.device)
     sampled = torch.nn.functional.grid_sample(blob[None, None], grid, align_corners=False)[0, 0]
     sidx = int(torch.argmax(sampled))
     view_cell = (sidx % sampled.shape[1], sidx // sampled.shape[1])

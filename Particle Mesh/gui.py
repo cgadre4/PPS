@@ -1,28 +1,54 @@
-import taichi as ti
 import math
-import os
 import glob
-from image_loader import browse_custom_image
+import torch
+from image_loader import browse_custom_image, load_image_particles
+
+IMAGE_PATTERNS = ('*.png', '*.jpg', '*.jpeg', '*.tif', '*.tiff')
+
 
 class SimulationGUI:
     def __init__(self, engine, camera, config):
         self.engine = engine
         self.camera = camera
         self.config = config
-        
+
         # UI sizing configurations
         self.ui_w = config["display"].get("ui_width", 0.15)  # Panel width fraction
-        self.show_fft_panel = config["simulation"].get("show_fft", True)
-        
+
         # State variables for log sliders
         self.log_G_val = math.log10(self.engine.G)
         self.log_time_val = config["sliders"]["time_scale_log"][2]
         self.friction_val = self.engine.friction
         self.softening_val = self.engine.softening_length
-        
-        # Image spawner variables
+
+        # Image spawner variables. The folder is scanned once (and on "Rescan"), not every frame.
         self.custom_image_path = None
         self.custom_image_name = None
+        self.image_files = self._scan_images()
+
+    @staticmethod
+    def _scan_images():
+        files = []
+        for pattern in IMAGE_PATTERNS:
+            files.extend(glob.glob(pattern))
+        return sorted(set(files))
+
+    def _range(self, name, fallback):
+        """[min, max] of a slider from config.json (fallback when the entry is missing)."""
+        spec = self.config["sliders"].get(name)
+        return (spec[0], spec[1]) if spec else fallback
+
+    def _spawn_image(self, path, spawn_density):
+        rcs = self.config["simulation"]["RENDER_CELL_SIZE"]
+        np_coords = load_image_particles(
+            path,
+            self.camera.cam_x, self.camera.cam_y, self.camera.zoom,
+            spawn_density, self.camera.width, self.camera.height,
+            int(self.camera.width / rcs), int(self.camera.height / rcs), rcs,
+            self.engine.universe_w, self.engine.universe_h
+        )
+        if np_coords is not None:
+            self.engine.load_particles_from_array(np_coords)
 
     def render(self, gui, fps_display, interaction_radius, spawn_vel, spawn_density):
         """
@@ -61,7 +87,6 @@ class SimulationGUI:
         if gui.button("Force: Coulomb"):
             self.engine.potential_type = 'coulomb'
             # Randomize charges in Coulomb mode
-            import torch
             self.engine.masses[:self.engine.num_active] = torch.randint(0, 2, (self.engine.num_active,), device=self.engine.device, dtype=torch.int8) * 2 - 1
             self.engine.precompute_kernel()
             
@@ -88,10 +113,10 @@ class SimulationGUI:
         if self.engine.solver_type == 'pm':
             gui.text("")
             gui.text("--- VIEW SETTINGS ---")
-            self.engine.pot_min_log = gui.slider_float("Potential Min (Log)", self.engine.pot_min_log, -5.0, 15.0)
-            self.engine.pot_max_log = gui.slider_float("Potential Max (Log)", self.engine.pot_max_log, -5.0, 15.0)
-            self.engine.field_min_log = gui.slider_float("Field Min (Log)", self.engine.field_min_log, -5.0, 15.0)
-            self.engine.field_max_log = gui.slider_float("Field Max (Log)", self.engine.field_max_log, -5.0, 15.0)
+            self.engine.pot_min_log = gui.slider_float("Potential Min (Log)", self.engine.pot_min_log, *self._range("potential_min_log", (-5.0, 15.0)))
+            self.engine.pot_max_log = gui.slider_float("Potential Max (Log)", self.engine.pot_max_log, *self._range("potential_max_log", (-5.0, 15.0)))
+            self.engine.field_min_log = gui.slider_float("Field Min (Log)", self.engine.field_min_log, *self._range("field_min_log", (-5.0, 15.0)))
+            self.engine.field_max_log = gui.slider_float("Field Max (Log)", self.engine.field_max_log, *self._range("field_max_log", (-5.0, 15.0)))
 
         # --- Engine Modifiers ---
         gui.text("")
@@ -101,7 +126,7 @@ class SimulationGUI:
         old_fr = self.engine.gravity_range
         self.engine.gravity_range = gui.slider_float("Force Range", self.engine.gravity_range, self.config["sliders"]["gravity_range"][0], self.config["sliders"]["gravity_range"][1])
         if old_fr != self.engine.gravity_range:
-            self.engine.precompute_kernel()
+            self.engine.request_kernel_rebuild()
             
         # Gas pressure scaling (PM Mode only)
         if self.engine.solver_type == 'pm':
@@ -138,7 +163,7 @@ class SimulationGUI:
             new_G = 10 ** self.log_G_val
             if new_G != self.engine.G:
                 self.engine.G = new_G
-                self.engine.precompute_kernel()
+                self.engine.request_kernel_rebuild()
             val_label = "Active ke" if self.engine.potential_type == 'coulomb' else "Active G"
             gui.text(f"{val_label}: {self.engine.G:.4f}")
             
@@ -146,7 +171,7 @@ class SimulationGUI:
             old_k = self.engine.spring_k
             self.engine.spring_k = gui.slider_float("Spring K", self.engine.spring_k, self.config["sliders"]["spring_k"][0], self.config["sliders"]["spring_k"][1])
             if old_k != self.engine.spring_k:
-                self.engine.precompute_kernel()
+                self.engine.request_kernel_rebuild()
                 
         elif self.engine.potential_type == 'lennard_jones':
             old_eps = self.engine.epsilon
@@ -154,7 +179,7 @@ class SimulationGUI:
             self.engine.epsilon = gui.slider_float("LJ Epsilon", self.engine.epsilon, self.config["sliders"]["epsilon"][0], self.config["sliders"]["epsilon"][1])
             self.engine.sigma = gui.slider_float("LJ Sigma", self.engine.sigma, self.config["sliders"]["sigma"][0], self.config["sliders"]["sigma"][1])
             if old_eps != self.engine.epsilon or old_sig != self.engine.sigma:
-                self.engine.precompute_kernel()
+                self.engine.request_kernel_rebuild()
                 
         # --- Uniform Gravity Field ---
         gui.text("")
@@ -187,40 +212,14 @@ class SimulationGUI:
                 
         if self.custom_image_path and self.custom_image_name:
             if gui.button(f"Spawn {self.custom_image_name}"):
-                # Load image coordinates
-                from image_loader import load_image_particles
-                grid_w = int(self.camera.width / self.config["simulation"]["RENDER_CELL_SIZE"])
-                grid_h = int(self.camera.height / self.config["simulation"]["RENDER_CELL_SIZE"])
-                np_coords = load_image_particles(
-                    self.custom_image_path,
-                    self.camera.cam_x, self.camera.cam_y, self.camera.zoom,
-                    spawn_density, self.camera.width, self.camera.height,
-                    grid_w, grid_h, self.config["simulation"]["RENDER_CELL_SIZE"],
-                    self.engine.universe_w, self.engine.universe_h
-                )
-                if np_coords is not None:
-                    self.engine.load_particles_from_array(np_coords)
-                    
-        # Scan folder for any local images
-        img_list = []
-        for ext in ('*.png', '*.jpg', '*.jpeg', '*.tif', '*.tiff'):
-            img_list.extend(glob.glob(ext))
-        img_list = [name for name in img_list if name != self.custom_image_name]
-        
-        for img_name in img_list:
-            if gui.button(f"Spawn {img_name}"):
-                from image_loader import load_image_particles
-                grid_w = int(self.camera.width / self.config["simulation"]["RENDER_CELL_SIZE"])
-                grid_h = int(self.camera.height / self.config["simulation"]["RENDER_CELL_SIZE"])
-                np_coords = load_image_particles(
-                    img_name,
-                    self.camera.cam_x, self.camera.cam_y, self.camera.zoom,
-                    spawn_density, self.camera.width, self.camera.height,
-                    grid_w, grid_h, self.config["simulation"]["RENDER_CELL_SIZE"],
-                    self.engine.universe_w, self.engine.universe_h
-                )
-                if np_coords is not None:
-                    self.engine.load_particles_from_array(np_coords)
+                self._spawn_image(self.custom_image_path, spawn_density)
+
+        # Images in the working folder (scanned at startup; rescan on demand)
+        if gui.button("Rescan Images"):
+            self.image_files = self._scan_images()
+        for img_name in self.image_files:
+            if img_name != self.custom_image_name and gui.button(f"Spawn {img_name}"):
+                self._spawn_image(img_name, spawn_density)
 
         # --- Bandpass & FFT Minimap (PM Mode only) ---
         if self.engine.solver_type == 'pm':
@@ -235,17 +234,17 @@ class SimulationGUI:
             if gui.button(bp_render_text):
                 self.engine.use_bandpass_render = not self.engine.use_bandpass_render
                 
-            self.engine.bp_inner = gui.slider_float("High-Pass (Inner)", self.engine.bp_inner, 0.0, 5.0)
-            self.engine.bp_outer = gui.slider_float("Low-Pass (Outer)", self.engine.bp_outer, 0.0, 5.0)
-            self.engine.bp_transition = gui.slider_float("Filter Softness", self.engine.bp_transition, 0.001, 1.0)
+            self.engine.bp_inner = gui.slider_float("High-Pass (Inner)", self.engine.bp_inner, *self._range("bp_inner", (-0.5, 5.0)))
+            self.engine.bp_outer = gui.slider_float("Low-Pass (Outer)", self.engine.bp_outer, *self._range("bp_outer", (-0.5, 5.0)))
+            self.engine.bp_transition = gui.slider_float("Filter Softness", self.engine.bp_transition, *self._range("bp_transition", (0.001, 1.0)))
             
         # --- Shortcuts Legend ---
         gui.text("")
         gui.text("--- CONTROL HOTKEYS ---")
         gui.text("LMB: Spawn | RMB: Delete")
-        gui.text("Space+LMB Drag: Pan View")
-        gui.text("Z+LMB Drag (or Z+Scroll): Zoom")
-        gui.text("Z+RMB Drag (or Scroll): Brush Size")
+        gui.text("Space+LMB / MMB Drag: Pan View")
+        gui.text("Z+LMB Drag or Up/Down: Zoom")
+        gui.text("Z+RMB Drag: Brush Size")
         if self.engine.solver_type == 'pm':
             gui.text("P: Toggle Potential View")
             gui.text("F: Toggle Vector Field")
