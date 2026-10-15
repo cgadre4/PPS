@@ -11,7 +11,7 @@ if torch.version.cuda:
 import math
 import time
 
-from config import CONFIG
+from particle_mesh.settings import CONFIG
 
 # Global Display Settings
 WIDTH = CONFIG["display"]["WIDTH"]
@@ -72,12 +72,12 @@ def _init_taichi():
 
 _init_taichi()
 
-from colors import THEMES
-from engine import SimulationEngine, NBODY_MAX_PARTICLES
-from camera import SimulationCamera
-from circle_renderer import CircleRenderer
-from mesh_renderer import MeshRenderer, build_view_grid  # noqa: F401  (build_view_grid re-exported for tools/tests)
-from gui import SimulationGUI
+from particle_mesh.render.themes import THEMES
+from particle_mesh.physics.engine import SimulationEngine, NBODY_MAX_PARTICLES
+from particle_mesh.render.camera import SimulationCamera
+from particle_mesh.render.circle_renderer import CircleRenderer
+from particle_mesh.render.mesh_renderer import MeshRenderer
+from particle_mesh.ui.panel import SimulationGUI
 
 # Brush ring and "show panel" arrow overlays. The fields are created in main() (after ti.init) and passed in.
 @ti.kernel
