@@ -21,13 +21,13 @@ Severity: **High** = wrong results, crash, or a feature that silently does nothi
 | 5 | High | N-body mode has no particle cap after startup. One brush stroke spawns ~785k particles, which needs terabytes for the N×N matrices, so it OOMs or hangs. | `main.py:61-64,234-237`, `nbody_solver.py:24-39` |
 | 6 | High | Mouse-wheel zoom and brush resize are dead code: Taichi 1.7.4 GGUI emits no wheel events. **Verified in source.** | `main.py:166-172` |
 | 7 | Medium | The k=0 (mean) mode of the potential isn't zeroed. That adds a huge constant to φ, which wrecks float32 precision at large force range and washes out the potential view. | `potentials.py:39-47,79-88` |
-| 8 | Medium | Forces are periodic (FFT) but particles are deleted at the edges, not wrapped. Mass near one edge pulls particles at the opposite edge. The GUI calls this mode "UNIVERSE WRAPPED". | `engine.py:198-206`, `gui.py:113` |
+| 8 | Medium | ~~Forces are periodic (FFT) but particles are deleted at the edges, not wrapped. Mass near one edge pulls particles at the opposite edge. The GUI calls this mode "UNIVERSE WRAPPED".~~ Fixed (XPU port): truly periodic. | `engine.py:198-206`, `gui.py:113` |
 | 9 | Medium | Pressure is applied as acceleration `-P∇ρ^γ` rather than `-∇P/ρ`, so it explodes in dense regions. | `potentials.py:106-115` |
 | 10 | Medium | ~~Potential, field and bandpass views are wrong whenever `RENDER_CELL_SIZE ≠ 1` (the local `config.json` uses 2).~~ Fixed. | `main.py:283-296,380-381` |
 | 11 | Medium | Particle data is read 3–4 times per frame plus a GPU sync. At 100M particles that is about 6–7 GB of memory traffic per frame. | `engine.py:199-206`, `pm_solver.py`, `mesh_renderer.py:37-46` |
 | 12 | Medium | About 1 GB of redundant precomputed grids, and the kernel is stored as full complex when only half is used. | `potentials.py:12-25`, `pm_solver.py:69-74` |
-| 13 | High (XPU) | The August Arc port passes XPU tensors into Taichi Vulkan kernels. Taichi copies every argument to the CPU and back on every call. **Verified, measured.** | `C:\Python Dev\PPS\Particle Mesh\pm_solver.py` |
-| 14 | Medium (XPU) | The port's Vulkan Poisson fallback (12 red-black Gauss-Seidel sweeps) is far from converged, so its gravity is effectively ~12-cell range. | same |
+| 13 | High (XPU) | ~~The August Arc port passes XPU tensors into Taichi Vulkan kernels. Taichi copies every argument to the CPU and back on every call. **Verified, measured.**~~ Fixed (XPU port): torch kernel backend on XPU. | `C:\Python Dev\PPS\Particle Mesh\pm_solver.py` |
+| 14 | Medium (XPU) | ~~The port's Vulkan Poisson fallback (12 red-black Gauss-Seidel sweeps) is far from converged, so its gravity is effectively ~12-cell range.~~ Removed (XPU port): FFT on every device. | same |
 | 15 | Low | Two diverged copies of the project, and neither is under working version control. | — |
 
 ---
@@ -85,6 +85,8 @@ For gravity and Coulomb, `K_k[0,0] = ∓G/λ²` with λ = 1/force_range. After `
 **Fix:** set `K_k[0,0] = 0` (the standard zero-mean condition for periodic Poisson solves). For harmonic and LJ the k = 0 term is also a pure constant and can be zeroed too.
 
 ### 2.8 Periodic forces with non-periodic particles (Medium)
+**Fixed** in the XPU port, which takes the truly periodic option. Positions wrap after each drift, CIC wraps its neighbour indices, N-body uses minimum-image displacements, and forces use periodic central differences. Particles are no longer deleted at the edges, which also removes the per-frame `.item()` sync. `reflective_walls` is unchanged.
+
 The FFT treats the universe as a torus, but in `wrap_delete` mode particles that leave are deleted. Near an edge, a particle feels the periodic image of mass on the opposite side. The CIC scatter also clamps rather than wraps (`pm_solver.py:14-15,38-39`), which piles the outermost half-cell of mass onto the edge cells.
 
 Pick one model:
@@ -163,6 +165,8 @@ Fixes:
 - **Sort particles by cell periodically.** The 7680² grid is 236 MB, far larger than any GPU cache, so CIC scatter and gather are cache-miss bound. Measured on the Arc B390 at 16M particles on a 4096² grid: sorting cut scatter from 103 ms to 39 ms and gather from 140 ms to 78 ms. One argsort plus permute costs 81 ms, so doing it every ~50 frames is nearly free. The same applies on CUDA.
 
 ### 3.3 Redundant FFTs
+**Fixed** in the XPU port: the solver keeps `rho_k`, which the minimap and bandpass view reuse. The softened kernel `K_eff` is also cached instead of recomputing `exp` every step.
+
 `main.py` recomputes `rfft2(density_grid)` for the bandpass render view and again for the FFT minimap, on top of the solver's own forward FFT. Keep `rho_k` on the solver (it's already computed in `solve`) and reuse it. The bandpass mask code is also duplicated verbatim (`main.py:311-320` and `366-375`); extract it into one function and cache the mask until the sliders change.
 
 ### 3.4 Force differencing
@@ -251,8 +255,8 @@ Native GPU kernels with atomics should be roughly as fast as the Taichi Vulkan n
 ## 6. Suggested order of work
 1. Consolidate into one git repo (§4).
 2. ~~Quick correctness fixes: 2.3 damping, 2.7 `K[0,0] = 0`, 2.2 Coulomb charge, 2.4 N-body zoom, 2.5 N-body cap, 2.1 overlay order.~~ **Done** on branch `fix/quick-correctness`. That branch also fixed the minimap's size when `RENDER_CELL_SIZE ≠ 1` and the point-reflection mirroring. Still open in 2.1: redundant FFTs (3.3) and antialiasing.
-3. XPU option A, to get the app running on this laptop.
-4. Install MSVC Build Tools and move to option B (Triton fused particle kernel). Benchmark against §5.3.
-5. Boundary model (2.8), pressure form (2.9), units and parity (2.11), and a small physics test suite.
+3. ~~XPU option A, to get the app running on this laptop.~~ **Done** on branch `feat/xpu-port`. It adds a pure-PyTorch kernel backend with a shared CIC stencil, periodic cell sorting, all rendering in PyTorch, a 2048² grid, reuse of `rho_k`, a cached `K_eff` and a LUT colormap. Measured on the B390: 1M particles ≈ 17 ms/frame (≈59 FPS), 4M ≈ 42 ms. The old path took 115 ms for physics alone at 1M. CUDA machines keep the Taichi kernels via `kernels.TaichiBackend`; that path is parity-tested on Taichi CPU but not run on CUDA here.
+4. Install MSVC Build Tools and move to option B (Triton fused particle kernel). The hot paths are already isolated in `kernels_torch.py`, and `TORCH_COMPILE: true` will try `torch.compile` and fall back to eager if it fails. Benchmark against the numbers in step 3.
+5. ~~Boundary model (2.8)~~ (done in the XPU port), pressure form (2.9), units and parity (2.11), and a small physics test suite.
 
 The benchmarks were run with throwaway scripts (`bench_xpu.py`, `bench_xpu2.py`, `test_set_image_order.py`) that are not committed. Ask for them to be re-created under a `bench/` folder if needed.

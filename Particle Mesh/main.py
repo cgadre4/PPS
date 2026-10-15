@@ -146,6 +146,7 @@ def main():
     print(f"  PyTorch Version:  {torch.__version__}")
     xpu_ok = hasattr(torch, "xpu") and torch.xpu.is_available()
     print(f"  Intel XPU Active: {xpu_ok}")
+    print(f"  Particle Kernels: {engine.kernels.name}")
     if not xpu_ok and engine.device.type == "cpu":
         print("  [NOTE] PyTorch is performing FFTs on CPU cores.")
         print(f"         Grid size: {CONFIG['simulation'].get('PHYSICS_GRID_W', 7680)}x{CONFIG['simulation'].get('PHYSICS_GRID_H', 7680)} cells.")
@@ -166,7 +167,7 @@ def main():
     # Initialize Camera, Renderers and GUI controllers
     camera = SimulationCamera(WIDTH, HEIGHT, engine.universe_w, engine.universe_h)
     circle_renderer = CircleRenderer()
-    mesh_renderer = MeshRenderer()
+    mesh_renderer = MeshRenderer(engine.kernels)
     sim_gui = SimulationGUI(engine, camera, CONFIG)
 
     # Spawner Brush settings
@@ -366,8 +367,8 @@ def main():
                 # FFT PIP radar thumbnail. It is handed to the renderer, which draws it before canvas.set_image()
                 # (set_image snapshots the frame immediately, so drawing it afterwards would never show).
                 fft_overlay = None
-                if engine.show_fft:
-                    rho_k = torch.fft.rfft2(engine.pm_solver.density_grid)
+                rho_k = engine.pm_solver.rho_k  # density spectrum from this step's solve (no extra FFT)
+                if engine.show_fft and rho_k is not None:
                     k_sq_real = engine.pm_solver.k_sq[:, :rho_k.shape[1]]
                     k_mag = torch.sqrt(k_sq_real)
 
@@ -414,9 +415,8 @@ def main():
                         engine.pot_min_log, engine.pot_max_log, 1.0,
                         overlay=fft_overlay
                     )
-                elif engine.use_bandpass_render:
+                elif engine.use_bandpass_render and rho_k is not None:
                     # Filter densities on the fly
-                    rho_k = torch.fft.rfft2(engine.pm_solver.density_grid)
                     k_sq_real = engine.pm_solver.k_sq[:, :rho_k.shape[1]]
                     k_mag = torch.sqrt(k_sq_real)
                     

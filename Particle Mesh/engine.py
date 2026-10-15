@@ -5,6 +5,7 @@ import json
 from potentials import PotentialsManager
 from nbody_solver import DirectNBodySolver
 from pm_solver import ParticleMeshSolver
+from kernels import make_backend
 
 # --- Load Configuration ---
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
@@ -48,7 +49,7 @@ class SimulationEngine:
         self.solver_type = CONFIG["simulation"].get("SOLVER", "pm").lower()
         self.potential_type = 'gravity' # 'gravity', 'lennard_jones', 'harmonic'
         self.pressure_model = 'none' # 'none', 'isothermal', 'polytropic'
-        self.boundary_mode = 'wrap_delete' # 'wrap_delete', 'reflective_walls'
+        self.boundary_mode = 'periodic' # 'periodic' (wrap around, matches the FFT solver), 'reflective_walls'
         
         # Load custom sliders from config
         sliders = CONFIG.get("sliders", {})
@@ -102,10 +103,38 @@ class SimulationEngine:
         self.vel[:self.num_active] = (torch.rand((self.num_active, 2), device=self.device) - 0.5) * 10.0
         self.masses[:self.num_active] = 1
         
+        # Particle-kernel backend: Taichi on shared memory (CUDA/CPU), pure PyTorch otherwise (Intel XPU)
+        self.kernels = make_backend(
+            self.device,
+            CONFIG["simulation"].get("KERNEL_BACKEND", "auto"),
+            CONFIG["simulation"].get("TORCH_COMPILE", False)
+        )
+        # Re-sort particles by grid cell every N steps so CIC scatter/gather hit memory coherently (0 = off)
+        self.sort_interval = CONFIG["simulation"].get("SORT_INTERVAL", 50)
+        self.step_count = 0
+
         # Initialize helper managers and solvers
         self.pot_manager = PotentialsManager(GRID_W, GRID_H, PHYSICS_CELL_SIZE, self.device)
         self.nbody_solver = DirectNBodySolver(self.device)
-        self.pm_solver = ParticleMeshSolver(GRID_W, GRID_H, PHYSICS_CELL_SIZE, self.device, self.pot_manager)
+        self.pm_solver = ParticleMeshSolver(GRID_W, GRID_H, PHYSICS_CELL_SIZE, self.device, self.pot_manager, self.kernels)
+
+    @property
+    def periodic(self):
+        return self.boundary_mode == 'periodic'
+
+    def sort_particles(self):
+        """
+        Reorders active particles by physics-grid cell. Memory-coherent CIC deposit/gather is ~2-4x faster.
+        """
+        n = self.num_active
+        if n < 2:
+            return
+        cell_x = torch.floor(self.pos[:n, 0] / PHYSICS_CELL_SIZE).clamp_(0, GRID_W - 1)
+        cell_y = torch.floor(self.pos[:n, 1] / PHYSICS_CELL_SIZE).clamp_(0, GRID_H - 1)
+        order = torch.argsort(cell_y * GRID_W + cell_x)
+        self.pos[:n] = self.pos[:n][order]
+        self.vel[:n] = self.vel[:n][order]
+        self.masses[:n] = self.masses[:n][order]
 
     def precompute_kernel(self):
         """
@@ -169,6 +198,8 @@ class SimulationEngine:
         self.vel[start:end] = new_vel
         self.masses[start:end] = self._new_masses(count)
         self.num_active += count
+        if self.periodic:
+            self.kernels.wrap(self.pos[start:end], count, self.universe_w, self.universe_h)
 
     def remove_particles(self, world_x, world_y, world_radius):
         if self.num_active == 0:
@@ -210,7 +241,8 @@ class SimulationEngine:
         if self.num_active == 0:
             return
 
-        # 1. Handle Boundaries
+        # 1. Handle Boundaries. Periodic needs nothing here: positions are wrapped right after each drift
+        # (no deletion, so no per-frame compaction or GPU->CPU sync).
         if self.boundary_mode == 'reflective_walls':
             hit_left = self.pos[:self.num_active, 0] < 0
             hit_right = self.pos[:self.num_active, 0] > self.universe_w
@@ -224,18 +256,6 @@ class SimulationEngine:
             self.pos[:self.num_active, 1] = torch.where(hit_top, 0.0, self.pos[:self.num_active, 1])
             self.pos[:self.num_active, 1] = torch.where(hit_bottom, float(self.universe_h), self.pos[:self.num_active, 1])
             self.vel[:self.num_active, 1] = torch.where(hit_top | hit_bottom, -self.vel[:self.num_active, 1] * 0.5, self.vel[:self.num_active, 1])
-        else:
-            in_bounds = (self.pos[:self.num_active, 0] >= 0) & (self.pos[:self.num_active, 0] < self.universe_w) & \
-                        (self.pos[:self.num_active, 1] >= 0) & (self.pos[:self.num_active, 1] < self.universe_h)
-            if not in_bounds.all().item():
-                new_count = in_bounds.sum().item()
-                self.pos[:new_count] = self.pos[:self.num_active][in_bounds]
-                self.vel[:new_count] = self.vel[:self.num_active][in_bounds]
-                self.masses[:new_count] = self.masses[:self.num_active][in_bounds]
-                self.num_active = new_count
-
-        if self.num_active == 0:
-            return
 
         # 2. Run Selected Physics Solver
         if self.solver_type == 'nbody':
@@ -248,21 +268,26 @@ class SimulationEngine:
                 'softening_length': self.softening_length
             }
             ax, ay = self.nbody_solver.solve(
-                self.pos[:self.num_active], 
-                self.masses[:self.num_active], 
-                self.potential_type, 
-                params
+                self.pos[:self.num_active],
+                self.masses[:self.num_active],
+                self.potential_type,
+                params,
+                self.periodic, self.universe_w, self.universe_h
             )
-            
+
             # Euler integration for velocity and positions (exponential friction decay never flips sign)
             damping = math.exp(-self.friction * dt)
             self.vel[:self.num_active, 0] = (self.vel[:self.num_active, 0] + ax * dt) * damping
             self.vel[:self.num_active, 1] = (self.vel[:self.num_active, 1] + ay * dt) * damping
-            
+
             self.pos[:self.num_active, 0] += self.vel[:self.num_active, 0] * dt
             self.pos[:self.num_active, 1] += self.vel[:self.num_active, 1] * dt
-            
+            if self.periodic:
+                self.kernels.wrap(self.pos, self.num_active, self.universe_w, self.universe_h)
+
         elif self.solver_type == 'pm':
+            if self.sort_interval > 0 and self.step_count % self.sort_interval == 0:
+                self.sort_particles()
             params = {
                 'G': self.G,
                 'force_range': self.gravity_range,
@@ -282,8 +307,12 @@ class SimulationEngine:
                 self.friction,
                 self.pressure_model,
                 self.pressure_strength,
-                self.gamma
+                self.gamma,
+                self.periodic,
+                self.universe_w,
+                self.universe_h
             )
+        self.step_count += 1
 
         # 3. Apply Uniform Gravity Field (CUDA Accelerated)
         if self.uniform_gravity_mag > 0:

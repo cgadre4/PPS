@@ -12,17 +12,20 @@
     "ui_width": 0.15
   },
   "simulation": {
-    "MAX_PARTICLES": 1000000,
+    "MAX_PARTICLES": 4000000,
     "NBODY_MAX_PARTICLES": 10000,
-    "PHYSICS_GRID_W": 1440,
-    "PHYSICS_GRID_H": 1440,
+    "KERNEL_BACKEND": "auto",
+    "TORCH_COMPILE": false,
+    "SORT_INTERVAL": 50,
+    "PHYSICS_GRID_W": 2048,
+    "PHYSICS_GRID_H": 2048,
     "PHYSICS_CELL_SIZE": 2.0,
     "RENDER_CELL_SIZE": 2.0,
     "ZOOM_INTENSITY_SCALE": 0.01,
     "MIN_LOG_DENSITY": 0.0,
     "MAX_LOG_DENSITY": 3.0,
     "SOLVER": "pm",
-    "initial_particles": 100
+    "initial_particles": 1000000
   },
   "sliders": {
     "gravity": [

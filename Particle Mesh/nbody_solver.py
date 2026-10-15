@@ -1,56 +1,24 @@
 import torch
-import taichi as ti
-
-@ti.kernel
-def nbody_taichi_solve_kernel(
-    pos: ti.types.ndarray(),
-    mass: ti.types.ndarray(),
-    ax: ti.types.ndarray(),
-    ay: ti.types.ndarray(),
-    num_active: ti.i32,
-    G: ti.f32,
-    softening: ti.f32
-):
-    eps2 = softening * softening
-    for p in range(num_active):
-        px, py = pos[p, 0], pos[p, 1]
-        accum_x, accum_y = 0.0, 0.0
-        for o in range(num_active):
-            if p != o:
-                dx = pos[o, 0] - px
-                dy = pos[o, 1] - py
-                r2 = dx * dx + dy * dy + eps2
-                inv_r3 = 1.0 / (r2 * ti.sqrt(r2))
-                m = ti.cast(mass[o], ti.f32)
-                accum_x += G * m * dx * inv_r3
-                accum_y += G * m * dy * inv_r3
-        ax[p] = accum_x
-        ay[p] = accum_y
 
 
 class DirectNBodySolver:
     def __init__(self, device):
         self.device = device
 
-    def solve(self, pos, masses, potential_type, params):
+    def solve(self, pos, masses, potential_type, params, periodic=False, universe_w=None, universe_h=None):
         """
-        Computes exact O(N^2) pairwise accelerations.
+        Computes exact O(N^2) pairwise accelerations (pure PyTorch, runs on any torch device).
+        periodic: use minimum-image displacements, matching the wrapped (toroidal) universe.
         """
         N = len(pos)
         if N <= 1:
             return torch.zeros(N, device=self.device), torch.zeros(N, device=self.device)
-            
-        if self.device.type not in ('cuda', 'xpu') and potential_type == 'gravity':
-            # Pure Taichi Vulkan GPU N-body solver (Runs 100% on Intel GPU via Vulkan)
-            ax = torch.zeros(N, device=self.device)
-            ay = torch.zeros(N, device=self.device)
-            G = float(params.get('G', 1.0))
-            softening = float(params.get('softening_length', 1.5))
-            nbody_taichi_solve_kernel(pos, masses, ax, ay, N, G, softening)
-            return ax, ay
-            
+
         # Compute pairwise displacement vectors diff[i, j] = pos[j] - pos[i]
         diff = pos.unsqueeze(0) - pos.unsqueeze(1)
+        if periodic:
+            size = torch.tensor([universe_w, universe_h], device=pos.device, dtype=pos.dtype)
+            diff -= size * torch.round(diff / size)
         dx = diff[:, :, 0]
         dy = diff[:, :, 1]
         
