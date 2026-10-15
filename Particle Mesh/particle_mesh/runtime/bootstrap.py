@@ -9,7 +9,7 @@ import os
 import taichi as ti
 import torch
 
-from particle_mesh.settings import CONFIG
+from particle_mesh.settings import SETTINGS
 
 
 def configure_torch_env():
@@ -30,7 +30,7 @@ def init_taichi(preferred=None):
     if is_initialized():
         return ti.lang.impl.current_cfg().arch
     if preferred is None:
-        preferred = CONFIG.get("simulation", {}).get("TAICHI_BACKEND", None)
+        preferred = SETTINGS.taichi_backend
     arch_map = {
         "cuda": ti.cuda,
         "vulkan": ti.vulkan,
@@ -91,6 +91,6 @@ def print_status(engine):
     print(f"  Particle Kernels: {engine.kernels.name}")
     if not xpu_ok and engine.device.type == "cpu":
         print("  [NOTE] PyTorch is performing FFTs on CPU cores.")
-        print(f"         Grid size: {CONFIG['simulation'].get('PHYSICS_GRID_W', 7680)}x{CONFIG['simulation'].get('PHYSICS_GRID_H', 7680)} cells.")
+        print(f"         Grid size: {SETTINGS.grid_w}x{SETTINGS.grid_h} cells.")
         print("         Consider reducing PHYSICS_GRID_W/H to 1024 or 2048 if CPU usage is too high.")
     print("=" * 65)

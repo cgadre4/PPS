@@ -4,24 +4,24 @@ import taichi as ti
 import torch
 from taichi.ui.utils import get_field_info
 
-from particle_mesh.settings import CONFIG
+from particle_mesh.settings import SETTINGS
 from particle_mesh.runtime.device import to_taichi
 
-WIDTH = CONFIG["display"]["WIDTH"]
-HEIGHT = CONFIG["display"]["HEIGHT"]
-RENDER_CELL_SIZE = CONFIG["simulation"]["RENDER_CELL_SIZE"]
+WIDTH = SETTINGS.width
+HEIGHT = SETTINGS.height
+RENDER_CELL_SIZE = SETTINGS.render_cell_size
 
-VIEW_W = int(WIDTH / RENDER_CELL_SIZE)
-VIEW_H = int(HEIGHT / RENDER_CELL_SIZE)
+VIEW_W = SETTINGS.view_w
+VIEW_H = SETTINGS.view_h
 
 # --- Vector arrow grid (spacing in render cells) ---
-PIXELS_PER_ARROW = CONFIG["display"].get("pixels_per_arrow", 32)
+PIXELS_PER_ARROW = SETTINGS.pixels_per_arrow
 NUM_ARROWS_X = VIEW_W // PIXELS_PER_ARROW
 NUM_ARROWS_Y = VIEW_H // PIXELS_PER_ARROW
 TOTAL_ARROWS = NUM_ARROWS_X * NUM_ARROWS_Y
 
 # FFT minimap: recompute the thumbnail every N frames (the spectrum changes slowly; it is ~0.5-1 ms per refresh)
-MINIMAP_INTERVAL = max(1, int(CONFIG["display"].get("minimap_interval", 4)))
+MINIMAP_INTERVAL = SETTINGS.minimap_interval
 # Largest count-indexed colour LUT (entries); beyond this the float colour path is used
 MAX_COUNT_LUT = 1 << 20
 # Opaque alpha in the packed RGBA8 word (little-endian bytes R, G, B, A), as a signed int32
@@ -104,8 +104,14 @@ def _sample(grid, view_grid):
 
 
 class MeshRenderer:
-    def __init__(self, kernels):
+    def __init__(self, kernels, settings=SETTINGS):
         self.kernels = kernels  # particle backend; provides splat_view on the sim device
+        # Render settings, captured once (no per-frame config reads)
+        self.min_log_density = settings.min_log_density
+        self.max_log_density = settings.max_log_density
+        self.zoom_intensity_scale = settings.zoom_intensity_scale
+        self.arrow_style = (settings.arrow_length_scale, settings.arrow_head_size, settings.arrow_head_angle,
+                            settings.arrow_width)
         self._bandpass = None
         self._bandpass_key = None
         self._count_lut = None
@@ -215,7 +221,6 @@ class MeshRenderer:
         """
         self._frame += 1
         solver = engine.pm_solver
-        sim_cfg = CONFIG["simulation"]
         rho_k = solver.rho_k  # density spectrum from this step's solve (no extra FFT)
         mask = None
         if rho_k is not None and (engine.show_fft or engine.use_bandpass_render):
@@ -237,20 +242,17 @@ class MeshRenderer:
             else:
                 filtered = torch.fft.irfft2(rho_k * mask, s=solver.density_grid.shape)
             view = _sample(filtered, self._view_grid_for(camera, engine)).clamp_(min=0.0)
-            self.render_grid(canvas, view, color_map, sim_cfg["MIN_LOG_DENSITY"], sim_cfg["MAX_LOG_DENSITY"], 1.0,
+            self.render_grid(canvas, view, color_map, self.min_log_density, self.max_log_density, 1.0,
                              overlay=overlay)
         else:
             self.render(canvas, engine.pos, engine.num_active, camera.cam_x, camera.cam_y, camera.zoom, color_map,
-                        sim_cfg["MIN_LOG_DENSITY"], sim_cfg["MAX_LOG_DENSITY"], sim_cfg["ZOOM_INTENSITY_SCALE"],
+                        self.min_log_density, self.max_log_density, self.zoom_intensity_scale,
                         overlay=overlay)
 
         if engine.show_field:
-            disp = CONFIG["display"]
             self.render_vectors(
                 canvas, solver.fx, solver.fy, camera, engine.universe_w, engine.universe_h, color_map,
-                engine.field_min_log, engine.field_max_log,
-                disp.get("arrow_length_scale", 1.5), disp.get("arrow_head_size", 0.25),
-                disp.get("arrow_head_angle", 0.5), disp.get("arrow_width", 0.001)
+                engine.field_min_log, engine.field_max_log, *self.arrow_style
             )
 
     def render(self, canvas, pos_tensor, num_active, cam_x, cam_y, zoom, color_map_tensor, min_log, max_log, zoom_intensity_scale, overlay=None):

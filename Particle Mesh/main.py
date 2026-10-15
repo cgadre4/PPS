@@ -4,13 +4,13 @@ import torch
 import math
 import time
 
-from particle_mesh.settings import CONFIG
+from particle_mesh.settings import CONFIG, SETTINGS
 
 # Global Display Settings
-WIDTH = CONFIG["display"]["WIDTH"]
-HEIGHT = CONFIG["display"]["HEIGHT"]
-FPS_TARGET = CONFIG["display"]["FPS_TARGET"]
-SOLVER_MODE = CONFIG["simulation"].get("SOLVER", "pm").lower()
+WIDTH = SETTINGS.width
+HEIGHT = SETTINGS.height
+FPS_TARGET = SETTINGS.fps_target
+SOLVER_MODE = SETTINGS.solver
 
 from particle_mesh.runtime import bootstrap
 
@@ -76,7 +76,7 @@ def main():
     init_arrow(arrow_verts)
 
     # Determine safe startup active particle count from configuration
-    initial_particles = CONFIG["simulation"].get("initial_particles", 1000000)
+    initial_particles = SETTINGS.initial_particles
     if SOLVER_MODE == 'nbody' and initial_particles > NBODY_MAX_PARTICLES:
         print(f"[Warning] initial_particles ({initial_particles}) is extremely high for O(N^2) Direct N-Body mode.")
         print(f"          Capping to NBODY_MAX_PARTICLES ({NBODY_MAX_PARTICLES}) to prevent a hang or out-of-memory error.")
@@ -110,9 +110,9 @@ def main():
     negative_color = torch.tensor([50.0, 150.0, 255.0], device=engine.device)
 
     # Spawner Brush settings
-    interaction_radius = CONFIG["sliders"]["brush_radius"][2]
-    spawn_vel = CONFIG["sliders"]["spawn_velocity"][2]
-    spawn_density = CONFIG["sliders"]["spawn_density"][2]
+    interaction_radius = SETTINGS.slider("brush_radius")[2]
+    spawn_vel = SETTINGS.slider("spawn_velocity")[2]
+    spawn_density = SETTINGS.slider("spawn_density")[2]
 
     # Keyboard / mouse button state with edge detection
     keys = KeyEdges(window, ('z', 'p', 'f', 'r', 'm', ti.ui.SPACE, ti.ui.RIGHT, ti.ui.LEFT, ti.ui.UP, ti.ui.DOWN,
@@ -208,7 +208,7 @@ def main():
             if prev_z_rmb:
                 dy = mouse_norm[1] - prev_mouse_norm[1]
                 interaction_radius *= math.exp(dy * 5.0)
-                interaction_radius = max(CONFIG["sliders"]["brush_radius"][0], min(CONFIG["sliders"]["brush_radius"][1], interaction_radius))
+                interaction_radius = max(SETTINGS.slider("brush_radius")[0], min(SETTINGS.slider("brush_radius")[1], interaction_radius))
         prev_z_rmb = z_rmb_active
 
         prev_mouse_norm = mouse_norm
