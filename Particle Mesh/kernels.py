@@ -5,7 +5,7 @@ Both backends expose the same methods, used by the PM solver, the engine and the
     prepare(pos, n, cell_size, grid_w, grid_h, periodic)        -> stencil shared by deposit + gather (or None)
     deposit(stencil, pos, mass, n, density, cell_size, periodic)
     gather_integrate(stencil, pos, vel, mass, n, fx, fy, cell_size, dt, damping, use_charge,
-                     periodic, universe_w, universe_h)
+                     periodic, universe_w, universe_h, accel_x=None, accel_y=None)
     wrap(pos, n, universe_w, universe_h)
     splat_view(pos, n, cam_x, cam_y, zoom, view_w, view_h, render_cell_size) -> float (view_h, view_w) tensor
 
@@ -73,8 +73,9 @@ class TorchBackend:
         self._deposit(stencil, mass, n, density)
 
     def gather_integrate(self, stencil, pos, vel, mass, n, fx, fy, cell_size, dt, damping, use_charge,
-                         periodic, universe_w, universe_h):
-        self._gather(stencil, pos, vel, mass, n, fx, fy, dt, damping, use_charge, periodic, universe_w, universe_h)
+                         periodic, universe_w, universe_h, accel_x=None, accel_y=None):
+        self._gather(stencil, pos, vel, mass, n, fx, fy, dt, damping, use_charge, periodic, universe_w, universe_h,
+                     accel_x, accel_y)
 
     def wrap(self, pos, n, universe_w, universe_h):
         KT.wrap_positions(pos, n, universe_w, universe_h)
@@ -94,11 +95,15 @@ class TaichiBackend:
         KTI.deposit_kernel(pos, mass, density, n, grid_w, grid_h, float(cell_size), int(periodic))
 
     def gather_integrate(self, stencil, pos, vel, mass, n, fx, fy, cell_size, dt, damping, use_charge,
-                         periodic, universe_w, universe_h):
+                         periodic, universe_w, universe_h, accel_x=None, accel_y=None):
         grid_w, grid_h = stencil
-        KTI.gather_integrate_kernel(pos, vel, mass, fx, fy, n, grid_w, grid_h, float(cell_size), float(dt),
-                                    float(damping), int(use_charge), int(periodic),
-                                    float(universe_w), float(universe_h))
+        has_accel = accel_x is not None
+        if not has_accel:
+            # Taichi needs real arrays for every ndarray argument; a 1x1 dummy is never read (has_accel = 0)
+            accel_x = accel_y = fx[:1, :1]
+        KTI.gather_integrate_kernel(pos, vel, mass, fx, fy, accel_x, accel_y, n, grid_w, grid_h, float(cell_size),
+                                    float(dt), float(damping), int(use_charge), int(periodic),
+                                    float(universe_w), float(universe_h), int(has_accel))
 
     def wrap(self, pos, n, universe_w, universe_h):
         KT.wrap_positions(pos, n, universe_w, universe_h)

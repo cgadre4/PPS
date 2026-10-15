@@ -31,6 +31,9 @@ class ParticleMeshSolver:
         # K_k * Gaussian softening, in rfft2 layout; rebuilt only when the kernel or the softening length changes
         self._K_eff = None
         self._K_eff_key = None
+        # Gaussian used to smooth the number density for pressure; rebuilt when the smoothing length changes
+        self._smooth = None
+        self._smooth_key = None
 
     def update_kernel(self, potential_type, params):
         """
@@ -74,6 +77,9 @@ class ParticleMeshSolver:
             self._K_eff = self.K_k[:, :cols] * gaussian
             self._K_eff_key = key
         phi_k = rho_k * self._K_eff
+        if potential_type == 'harmonic':
+            # Mean-field scaling: spring force per unit total mass, as in the N-body solver (independent of N)
+            phi_k.mul_(1.0 / num_active)
 
         # Inverse FFT to get potential
         self.phi = torch.fft.irfft2(phi_k, s=self.density_grid.shape)
@@ -88,12 +94,31 @@ class ParticleMeshSolver:
             self.fx.neg_().div_(self.cell_size)
             self.fy.neg_().div_(self.cell_size)
 
-        # Add real-space gas pressure if active
-        if pressure_model != 'none':
+        # Gas pressure: a = -grad(P)/rho on a smoothed NUMBER density (AUDIT 2.9)
+        accel_x = accel_y = None
+        if pressure_model != 'none' and pressure_strength > 1e-5:
             gamma_val = gamma if pressure_model == 'polytropic' else 1.0
-            force_px, force_py = self.pot_manager.compute_pressure_forces(self.density_grid, pressure_strength, gamma_val)
-            self.fx += force_px
-            self.fy += force_py
+            if potential_type == 'coulomb':
+                # density_grid holds charge here; pressure acts on particles, so deposit |mass| separately
+                number = torch.zeros_like(self.density_grid)
+                self.kernels.deposit(stencil, pos, masses[:num_active].abs(), num_active, number, self.cell_size, periodic)
+                number_k = torch.fft.rfft2(number)
+            else:
+                number_k = rho_k
+            smooth_len = max(softening_length, self.cell_size)
+            if self._smooth_key != smooth_len:
+                self._smooth = torch.exp(-self.k_sq[:, :number_k.shape[1]] * (smooth_len**2) / 2.0)
+                self._smooth_key = smooth_len
+            area = self.cell_size ** 2
+            rho_smooth = torch.fft.irfft2(number_k * self._smooth, s=self.density_grid.shape).clamp_(min=0.0).div_(area)
+            px, py = self.pot_manager.compute_pressure_forces(
+                rho_smooth, pressure_strength, gamma_val, periodic, density_floor=0.05 / area
+            )
+            if potential_type == 'coulomb':
+                accel_x, accel_y = px, py   # charge-independent: gathered without the +/-1 charge factor
+            else:
+                self.fx += px
+                self.fy += py
 
         # Exponential friction decay: stays in (0, 1] for any friction * dt, unlike (1 - friction * dt)
         damping = math.exp(-friction * dt)
@@ -102,5 +127,6 @@ class ParticleMeshSolver:
         self.kernels.gather_integrate(
             stencil, pos, vel, masses, num_active,
             self.fx, self.fy, self.cell_size, dt, damping,
-            potential_type == 'coulomb', periodic, universe_w, universe_h
+            potential_type == 'coulomb', periodic, universe_w, universe_h,
+            accel_x, accel_y
         )

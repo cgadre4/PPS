@@ -32,19 +32,26 @@ class PotentialsManager:
         params: dict containing sliders (G, epsilon, sigma, spring_k, force_range)
         """
         force_range = params.get('force_range', 1000.0)
-        
+
+        # Units (AUDIT 2.11). Gravity and Coulomb use the 2D law |a| = G * m / r, the same law as the direct
+        # N-body solver: the Poisson equation is lap(phi) = 2*pi*G*rho_area, i.e. phi_k = -2*pi*G * rho_area_k / k^2.
+        # The solver deposits mass per CELL, so divide by the cell area (rho_area = rho_cell / cell_size^2).
+        # Harmonic and Lennard-Jones are FFTs of a sampled pair potential V(r): a discrete convolution with
+        # mass-per-cell already sums V over particles, so they need no area factor.
+        area_scale = 2.0 * math.pi / (self.cell_size ** 2)
+
         if potential_type == 'gravity':
             G = params.get('G', 1.0)
             # Screened Yukawa gravity in Fourier space: lambda_sq = (1 / force_range)^2
             lambda_sq = (1.0 / force_range)**2
             denom = self.k_sq + lambda_sq
             denom_safe = denom.clone()
-            
+
             # Prevent division by zero at k = (0,0) if there's no screening
             if lambda_sq < 1e-8:
                 denom_safe[0, 0] = 1e-8
-                
-            K_k = -G / denom_safe
+
+            K_k = -G * area_scale / denom_safe
             
         elif potential_type == 'harmonic':
             spring_k = params.get('spring_k', 1.0)
@@ -82,7 +89,7 @@ class PotentialsManager:
                 denom_safe[0, 0] = 1e-8
                 
             # Repelling force for like charges: positive sign
-            K_k = ke / denom_safe
+            K_k = ke * area_scale / denom_safe
 
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
@@ -93,28 +100,32 @@ class PotentialsManager:
         K_k[0, 0] = 0.0
         return K_k
 
-    def compute_pressure_forces(self, density, pressure_strength, gamma):
+    def compute_pressure_forces(self, density, pressure_strength, gamma, periodic, density_floor):
         """
-        Computes polytropic gas pressure forces in real space: F = -P * grad(rho^gamma).
-        
-        density: 2D tensor of mass density on grid
-        pressure_strength: scaling constant P
+        Polytropic gas pressure acceleration a = -grad(P) / rho with P = K * rho^gamma (AUDIT 2.9).
+        For gamma = 1 (isothermal) this is -K * grad(ln rho): it depends on the density *profile*, not its amplitude,
+        so dense clumps no longer get explosive kicks.
+
+        density: smoothed number density per unit area (H, W), >= 0
+        pressure_strength: K
         gamma: polytropic index (1.0 = isothermal, 1.4 = air, 1.67 = monatomic gas)
+        density_floor: rho used in the denominator is at least this (keeps near-empty cells finite)
         """
         if pressure_strength <= 1e-5:
             return torch.zeros_like(density), torch.zeros_like(density)
-            
-        # Polytropic density relation
-        rho_poly = density ** gamma
-        
-        # Calculate real-space spatial gradients
-        grad_py, grad_px = torch.gradient(rho_poly)
-        
-        # Convert grid step gradient to physical scale
-        force_px = -pressure_strength * grad_px / self.cell_size
-        force_py = -pressure_strength * grad_py / self.cell_size
-        
-        return force_px, force_py
+
+        p = density ** gamma
+        if periodic:
+            inv_2dx = 0.5 / self.cell_size
+            grad_px = (torch.roll(p, -1, dims=1) - torch.roll(p, 1, dims=1)).mul_(inv_2dx)
+            grad_py = (torch.roll(p, -1, dims=0) - torch.roll(p, 1, dims=0)).mul_(inv_2dx)
+        else:
+            grad_py, grad_px = torch.gradient(p)
+            grad_px.div_(self.cell_size)
+            grad_py.div_(self.cell_size)
+
+        scale = -pressure_strength / density.clamp(min=density_floor)
+        return grad_px.mul_(scale), grad_py.mul_(scale)
 
     def get_uniform_gravity_forces(self, magnitude, angle_deg):
         """

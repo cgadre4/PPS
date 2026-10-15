@@ -52,8 +52,9 @@ def deposit_kernel(
 def gather_integrate_kernel(
     pos: ti.types.ndarray(), vel: ti.types.ndarray(), mass: ti.types.ndarray(),
     force_x: ti.types.ndarray(), force_y: ti.types.ndarray(),
+    accel_x: ti.types.ndarray(), accel_y: ti.types.ndarray(),
     num_active: ti.i32, grid_w: ti.i32, grid_h: ti.i32, cell_size: ti.f32, dt: ti.f32, damping: ti.f32,
-    use_charge: ti.i32, periodic: ti.i32, universe_w: ti.f32, universe_h: ti.f32
+    use_charge: ti.i32, periodic: ti.i32, universe_w: ti.f32, universe_h: ti.f32, has_accel: ti.i32
 ):
     for p in range(num_active):
         i0, j0, i1, j1, wx, wy = _cic_corners(pos[p, 0], pos[p, 1], cell_size, grid_w, grid_h, periodic)
@@ -68,9 +69,15 @@ def gather_integrate_kernel(
         q = 1.0
         if use_charge != 0:
             q = ti.cast(mass[p], ti.f32)
+        fx *= q
+        fy *= q
+        # Charge-independent extra acceleration (gas pressure in Coulomb mode)
+        if has_accel != 0:
+            fx += accel_x[j0, i0] * w00 + accel_x[j0, i1] * w10 + accel_x[j1, i0] * w01 + accel_x[j1, i1] * w11
+            fy += accel_y[j0, i0] * w00 + accel_y[j0, i1] * w10 + accel_y[j1, i0] * w01 + accel_y[j1, i1] * w11
 
-        vel[p, 0] = (vel[p, 0] + q * fx * dt) * damping
-        vel[p, 1] = (vel[p, 1] + q * fy * dt) * damping
+        vel[p, 0] = (vel[p, 0] + fx * dt) * damping
+        vel[p, 1] = (vel[p, 1] + fy * dt) * damping
         x = pos[p, 0] + vel[p, 0] * dt
         y = pos[p, 1] + vel[p, 1] * dt
         if periodic != 0:

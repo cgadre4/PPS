@@ -51,8 +51,10 @@ def deposit(stencil, mass, num_active, density):
 
 
 def gather_integrate(stencil, pos, vel, mass, num_active, force_x, force_y, dt, damping, use_charge,
-                     periodic, universe_w, universe_h):
-    """Interpolate forces at the particles, kick, drift (semi-implicit Euler) and wrap if periodic. In place."""
+                     periodic, universe_w, universe_h, accel_x=None, accel_y=None):
+    """Interpolate forces at the particles, kick, drift (semi-implicit Euler) and wrap if periodic. In place.
+    use_charge scales force_x/force_y by each particle's +/-1 charge; accel_x/accel_y (optional grids, e.g. gas
+    pressure in Coulomb mode) are added without that factor."""
     p = pos[:num_active]
     v = vel[:num_active]
     ax = (force_x.view(-1)[stencil.idx] * stencil.w).sum(0)
@@ -61,6 +63,9 @@ def gather_integrate(stencil, pos, vel, mass, num_active, force_x, force_y, dt, 
         q = mass[:num_active].to(ax.dtype)
         ax.mul_(q)
         ay.mul_(q)
+    if accel_x is not None:
+        ax.add_((accel_x.view(-1)[stencil.idx] * stencil.w).sum(0))
+        ay.add_((accel_y.view(-1)[stencil.idx] * stencil.w).sum(0))
     v[:, 0].add_(ax, alpha=dt)
     v[:, 1].add_(ay, alpha=dt)
     v.mul_(damping)
