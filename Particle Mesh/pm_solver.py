@@ -37,23 +37,14 @@ class ParticleMeshSolver:
         self.active_potential_type = potential_type
         self.K_k = self.pot_manager.get_fourier_kernel(potential_type, params)
 
-    def solve(self, pos, vel, masses, num_active, potential_type, params, dt, friction, pressure_model, pressure_strength, gamma,
-              periodic, universe_w, universe_h):
+    def _compute_field(self, stencil, pos, masses, num_active, potential_type, params, periodic):
         """
-        Runs Particle-Mesh solver:
-        1. Deposits mass to grid (CIC).
-        2. Solves the Poisson equation with FFTs on the torch device.
-        3. Gathers forces back to the particles and integrates them (and wraps them if periodic).
+        Deposit -> rfft2 -> kernel (with Gaussian softening) -> irfft2 -> central differences.
+        Updates self.density_grid, self.rho_k, self.phi, self.fx, self.fy (the force per unit mass/charge).
         """
-        if num_active == 0:
-            return
-
-        # Re-fetch kernel if model parameters changed or type switched
+        # Re-fetch kernel if the potential type switched
         if self.K_k is None or self.active_potential_type != potential_type:
             self.update_kernel(potential_type, params)
-
-        # The deposit and the gather both use this step's positions, so the CIC stencil is built once
-        stencil = self.kernels.prepare(pos, num_active, self.cell_size, self.grid_w, self.grid_h, periodic)
 
         # Clear grid and scatter masses
         self.density_grid.zero_()
@@ -87,6 +78,41 @@ class ParticleMeshSolver:
             self.fy, self.fx = torch.gradient(self.phi)
             self.fx.neg_().div_(self.cell_size)
             self.fy.neg_().div_(self.cell_size)
+
+    def accelerations_at(self, pos, masses, num_active, start, end, potential_type, params, periodic,
+                         universe_w, universe_h):
+        """
+        Field acceleration (no pressure, no integration) felt by particles start:end, from all num_active
+        particles. CIC interpolation on the cell-centred grid is exactly bilinear grid_sample with
+        align_corners=False. Used to give freshly spawned galaxies their true circular speed.
+        Overwrites the solver's field state (the next solve() recomputes it anyway).
+        """
+        stencil = self.kernels.prepare(pos, num_active, self.cell_size, self.grid_w, self.grid_h, periodic)
+        self._compute_field(stencil, pos, masses, num_active, potential_type, params, periodic)
+        p = pos[start:end]
+        size = torch.tensor([universe_w, universe_h], device=pos.device, dtype=pos.dtype)
+        coords = (p / size * 2.0 - 1.0).view(1, 1, -1, 2)
+        forces = torch.nn.functional.grid_sample(torch.stack((self.fx, self.fy))[None], coords,
+                                                 mode='bilinear', padding_mode='border', align_corners=False)
+        return forces[0, 0, 0], forces[0, 1, 0]
+
+    def solve(self, pos, vel, masses, num_active, potential_type, params, dt, friction, pressure_model, pressure_strength, gamma,
+              periodic, universe_w, universe_h):
+        """
+        Runs Particle-Mesh solver:
+        1. Deposits mass to grid (CIC).
+        2. Solves the Poisson equation with FFTs on the torch device.
+        3. Gathers forces back to the particles and integrates them (and wraps them if periodic).
+        """
+        if num_active == 0:
+            return
+
+        # The deposit and the gather both use this step's positions, so the CIC stencil is built once
+        stencil = self.kernels.prepare(pos, num_active, self.cell_size, self.grid_w, self.grid_h, periodic)
+
+        self._compute_field(stencil, pos, masses, num_active, potential_type, params, periodic)
+        rho_k = self.rho_k
+        softening_length = params.get('softening_length', 1.5)
 
         # Gas pressure: a = -grad(P)/rho on a smoothed NUMBER density (AUDIT 2.9)
         accel_x = accel_y = None

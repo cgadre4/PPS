@@ -150,14 +150,7 @@ class SimulationEngine:
         Triggers potentials precomputation inside solvers on parameter change.
         """
         self._kernel_dirty_since = None
-        params = {
-            'G': self.G,
-            'force_range': self.gravity_range,
-            'spring_k': self.spring_k,
-            'epsilon': self.epsilon,
-            'sigma': self.sigma
-        }
-        self.pm_solver.update_kernel(self.potential_type, params)
+        self.pm_solver.update_kernel(self.potential_type, self._physics_params())
 
     def capacity(self):
         """
@@ -175,19 +168,44 @@ class SimulationEngine:
             return torch.randint(0, 2, (count,), device=self.device, dtype=torch.int8) * 2 - 1
         return torch.ones(count, device=self.device, dtype=torch.int8)
 
-    def _circular_speed(self, r, world_radius, count):
+    def _physics_params(self):
+        return {
+            'G': self.G,
+            'force_range': self.gravity_range,
+            'spring_k': self.spring_k,
+            'epsilon': self.epsilon,
+            'sigma': self.sigma,
+            'softening_length': self.softening_length
+        }
+
+    def _set_orbital_velocities(self, start, end, world_x, world_y, vel_mult):
         """
-        Circular orbit speed for a freshly spawned disk of `count` unit masses (AUDIT 2.12).
-        Both solvers use the 2D law |a| = G*M/r, so v^2 = G * M(<r): M(<r) = count * r/R for the "dense core"
-        (r uniform) and count * (r/R)^2 for the uniform disk. The force-range (Yukawa) screening of the PM
-        kernel weakens a point mass's pull by (kappa*r) * K1(kappa*r), kappa = 1/range; applying that factor to
-        the enclosed mass is an approximation that keeps disks close to equilibrium at short ranges too.
+        Gives particles start:end (a freshly spawned disk centred on world_x, world_y) the circular speed of the
+        field they actually feel (AUDIT 2.12): v = sqrt(r * a_inward), clockwise, times vel_mult. The acceleration
+        comes from a real field evaluation (PM field solve or direct N-body) including the new disk itself, any
+        existing particles, softening, force-range screening and periodic images, so no analytic approximation.
         """
-        frac = r / max(world_radius, 1e-6)
-        m_enc = count * (frac * frac if self.uniform_spawn else frac)
-        x = (r / self.gravity_range).clamp_(min=1e-6)
-        screening = x * torch.special.modified_bessel_k1(x)
-        return torch.sqrt(abs(self.G) * m_enc * screening)
+        n = self.num_active
+        if self._kernel_dirty_since is not None:
+            self.precompute_kernel()   # apply a pending slider change so speeds match the current G
+        params = self._physics_params()
+        if self.solver_type == 'nbody':
+            ax, ay = self.nbody_solver.solve(self.pos[:n], self.masses[:n], 'gravity', params,
+                                             self.periodic, self.universe_w, self.universe_h)
+            ax, ay = ax[start:end], ay[start:end]
+        else:
+            ax, ay = self.pm_solver.accelerations_at(self.pos, self.masses, n, start, end, 'gravity', params,
+                                                     self.periodic, self.universe_w, self.universe_h)
+        d = self.pos[start:end] - torch.tensor([world_x, world_y], device=self.device)
+        if self.periodic:
+            size = torch.tensor([self.universe_w, self.universe_h], device=self.device, dtype=d.dtype)
+            d -= size * torch.round(d / size)        # minimum image: the disk may straddle an edge
+        r = d.norm(dim=1).clamp_(min=1e-6)
+        a_inward = -(ax * d[:, 0] + ay * d[:, 1]) / r
+        speed = torch.sqrt((a_inward * r).clamp_(min=0.0)) * vel_mult
+        # Clockwise tangent (sin(theta), -cos(theta)) = (dy, -dx) / r
+        self.vel[start:end, 0] = d[:, 1] / r * speed
+        self.vel[start:end, 1] = -d[:, 0] / r * speed
 
     def add_galaxy(self, world_x, world_y, world_radius, count=5000, vel_mult=0.0):
         count = int(count)
@@ -209,10 +227,7 @@ class SimulationEngine:
         new_pos[:, 1] = world_y + r * torch.sin(theta)
         
         if self.potential_type == 'gravity':
-            orbital_speed = self._circular_speed(r, world_radius, count) * vel_mult
-            new_vel = torch.zeros((count, 2), device=self.device)
-            new_vel[:, 0] = torch.sin(theta) * orbital_speed
-            new_vel[:, 1] = -torch.cos(theta) * orbital_speed
+            new_vel = torch.zeros((count, 2), device=self.device)  # set from the measured field below
         else:
             # Thermal velocities; vel_mult = 1 (the slider default) gives the same spread as before
             new_vel = (torch.rand((count, 2), device=self.device) - 0.5) * THERMAL_SPEED * vel_mult
@@ -224,6 +239,8 @@ class SimulationEngine:
         self.num_active += count
         if self.periodic:
             self.kernels.wrap(self.pos[start:end], count, self.universe_w, self.universe_h)
+        if self.potential_type == 'gravity' and vel_mult != 0.0:
+            self._set_orbital_velocities(start, end, world_x, world_y, vel_mult)
 
     def remove_particles(self, world_x, world_y, world_radius):
         if self.num_active == 0:
@@ -284,15 +301,8 @@ class SimulationEngine:
             self.vel[:self.num_active, 1] = torch.where(hit_top | hit_bottom, -self.vel[:self.num_active, 1] * 0.5, self.vel[:self.num_active, 1])
 
         # 2. Run Selected Physics Solver
+        params = self._physics_params()
         if self.solver_type == 'nbody':
-            params = {
-                'G': self.G,
-                'force_range': self.gravity_range,
-                'spring_k': self.spring_k,
-                'epsilon': self.epsilon,
-                'sigma': self.sigma,
-                'softening_length': self.softening_length
-            }
             ax, ay = self.nbody_solver.solve(
                 self.pos[:self.num_active],
                 self.masses[:self.num_active],
@@ -314,14 +324,6 @@ class SimulationEngine:
         elif self.solver_type == 'pm':
             if self.sort_interval > 0 and self.step_count % self.sort_interval == 0:
                 self.sort_particles()
-            params = {
-                'G': self.G,
-                'force_range': self.gravity_range,
-                'spring_k': self.spring_k,
-                'epsilon': self.epsilon,
-                'sigma': self.sigma,
-                'softening_length': self.softening_length
-            }
             self.pm_solver.solve(
                 self.pos, 
                 self.vel, 

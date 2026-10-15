@@ -55,3 +55,18 @@ def test_view_grid_aligns_with_particle_view(make_engine, zoom, frac):
     sidx = int(torch.argmax(sampled))
     view_cell = (sidx % sampled.shape[1], sidx // sampled.shape[1])
     assert abs(view_cell[0] - particle_cell[0]) <= 1 and abs(view_cell[1] - particle_cell[1]) <= 1
+
+
+def test_fft_thumbnail_is_antialiased(make_engine):
+    """AUDIT 2.1: shrinking the spectrum must average, not point-sample. A checkerboard spectrum (alternating
+    0 / 1 cells) should become a flat ~mid-grey thumbnail, not a high-contrast alias pattern."""
+    eng = make_engine()
+    renderer = MR.MeshRenderer(eng.kernels)
+    h, w = eng.pm_solver.k_sq.shape
+    jj, ii = torch.meshgrid(torch.arange(h, device=eng.device), torch.arange(w, device=eng.device), indexing='ij')
+    checker = ((ii + jj) % 2).to(torch.complex64)
+    mask = torch.ones((h, w), device=eng.device)
+    thumb, tw, th = renderer.fft_thumbnail(checker, mask, 100)
+    assert (tw, th) == (100, 100)
+    t = thumb.float()
+    assert float(t.std()) < 0.05 * float(t.mean())          # uniform after proper averaging

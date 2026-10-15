@@ -25,7 +25,7 @@ uv run python main.py
 ```
 
 - Run from this folder. uv finds the project at the repo root. Python 3.13 (`../.python-version`); `torch` comes from the PyTorch XPU wheel index (`[tool.uv] extra-index-url` in `../pyproject.toml`).
-- `config.json` is resolved relative to each module, so the working directory doesn't matter for config. It does matter for `gui.py`, which globs the current directory for spawnable images.
+- `config.json` is read once by `config.py`, relative to that file, so the working directory doesn't matter for config. It does matter for `gui.py`, which scans the current directory for spawnable images (at startup and on "Rescan Images").
 - Device and backend selection at startup (a status banner prints the result):
   - torch device: CUDA if available, else Intel XPU (`engine._get_torch_device`), else CPU.
   - Taichi arch: CUDA first if torch sees CUDA, otherwise Vulkan → OpenGL → CUDA → CPU (`main._init_taichi`). Override with `simulation.TAICHI_BACKEND`.
@@ -116,27 +116,33 @@ Frame loop (`main.py`): input handling -> brush spawn/erase -> `engine.step(dt)`
   - Harmonic springs use mean-field scaling (force per unit total mass, i.e. ÷N) in both solvers.
   - Lennard-Jones and harmonic PM kernels are FFTs of a sampled `V(r)` and need no area factor.
   - Pressure is `a = -∇P/ρ`, `P = K·ρ^γ`, on a Gaussian-smoothed number density per unit area with a density floor. In Coulomb mode, pressure uses a separate `|mass|` deposit and is gathered without the charge factor (`accel_x/accel_y`).
-  - Spawned gravity disks get `v = vel_mult · sqrt(G·M(<r)·(κr)K₁(κr))`, where `κ = 1/force_range` and `vel_mult` is the "Spawn Velocity (x orbit)" slider (1 = circular). Other potentials get a thermal spread of `THERMAL_SPEED·vel_mult`.
+  - Spawned gravity disks get their circular speed from the field they actually feel: `v = vel_mult · sqrt(r · a_inward)`.
+    - The acceleration comes from `pm_solver.accelerations_at` (a field-only solve, bilinear-sampled, which equals CIC) or from the N-body solver, so it includes the disk itself, existing particles, softening, screening and periodic images.
+    - `vel_mult` is the "Spawn Velocity (x orbit)" slider (1 = circular). Disks hold their radius to within 0.5% over 2 s.
+    - Other potentials get a thermal spread of `THERMAL_SPEED·vel_mult`.
   - Default G is 0.64, retuned so the default PM scene keeps its pre-fix strength at `PHYSICS_CELL_SIZE: 2`.
 - **Kernel caching:**
   - `potentials.py` `PotentialsManager.get_fourier_kernel` builds `K_k`: gravity/Coulomb analytically as screened Yukawa `-+G/(k^2 + 1/range^2)`, harmonic/LJ by FFT of a real-space periodic potential on the full grid.
   - `K_k[0, 0]` is always zeroed, so phi has zero mean. Don't remove that: the mean term destroys float32 precision in phi.
-  - The PM solver only rebuilds `K_k` when the potential *type* changes. Any change to a kernel parameter (G, force range, spring_k, epsilon, sigma) must call `engine.precompute_kernel()`, as the GUI does for its sliders.
+  - The PM solver only rebuilds `K_k` when the potential *type* changes. Any change to a kernel parameter (G, force range, spring_k, epsilon, sigma) must trigger a rebuild: `engine.request_kernel_rebuild()` (debounced; what the GUI sliders use) or `engine.precompute_kernel()` (immediate).
   - `K_eff` is rebuilt automatically when `K_k` or the softening length changes.
   - Kernels and `k_sq` are stored in **rfft2 half-spectrum layout** `(H, W//2+1)`. Gravity/Coulomb `K_k` is real; harmonic/LJ is the complex `rfft2` of `V(r)`. `pm_solver.k_sq` is the same tensor as `pot_manager.k_sq`. The real-space distance grid is built on demand only.
   - GUI sliders call `engine.request_kernel_rebuild()`, which is debounced: the rebuild runs in `step()` once the value has been still for `KERNEL_REBUILD_DELAY` (0.15 s). Call `precompute_kernel()` directly when an immediate rebuild is needed (e.g. switching potential).
-- **N-body solver (`nbody_solver.py`)** builds full NxN pairwise matrices in PyTorch (any device) and returns accelerations; integration happens in `engine.step`.
+- **N-body solver (`nbody_solver.py`)** computes exact pairwise accelerations in PyTorch (any device), processing targets in row tiles of `TILE_ELEMENTS` against all sources, so memory is O(N·tile). Integration happens in `engine.step`.
 - **Adding or changing a potential touches four places:** `potentials.get_fourier_kernel` (PM), `nbody_solver.solve` (N-body), `engine.precompute_kernel`/`step` param dicts, and the buttons/sliders in `gui.py`.
 
-### Taichi import-order constraint
+### Taichi initialisation order
 
-`mesh_renderer.py`, `circle_renderer.py` and `main.py` allocate Taichi fields at module import time, sized from `config.json`. `kernels.py` reads the active Taichi arch. `ti.init()` (via `_init_taichi()`) must run before these modules are imported; this is why `main.py` imports them below it. Keep that ordering when adding modules that declare fields.
+- No module allocates Taichi fields at import, so modules can be imported in any order, even before `ti.init()`. `tests/test_imports.py` enforces this.
+- Fields are created by their owners after initialisation: `MeshRenderer.__init__` (`display_pixels`, arrow buffers), `CircleRenderer.__init__`, and the brush-ring/arrow fields inside `main.main()`, which are passed to template kernels.
+- `ti.init()` must still run before you construct a `SimulationEngine` (`kernels.make_backend` reads the active arch) or any renderer. `main.py` runs `_init_taichi()` at import, and the tests and tools rely on `import main` doing that.
+- Keep new Taichi fields out of module scope.
 
 ### Array layout conventions
 
 - PyTorch grids (`density_grid`, `phi`, `fx`, `fy`, `k_sq`, viewport density) are `[row=y, col=x]`; flat index `j * W + i`.
-- Taichi fields (`display_pixels`) are `[x, y]`; `MeshRenderer._present` transposes the `(VIEW_H, VIEW_W, 3)` image before `from_torch`. Row 0 is the bottom of the screen.
-- World coordinates span `[0, PHYSICS_GRID_W * PHYSICS_CELL_SIZE)`. `camera.py` maps screen pixels to world via `cam_x/cam_y` (world-space bottom-left of the view) and `zoom`. Advanced PM views resample grids into the viewport with `grid_sample`, using normalised `[-1, 1]` coordinates from `main.build_view_grid()`.
+- Taichi fields (`MeshRenderer.display_pixels`) are `[x, y]`; `MeshRenderer._present` transposes the `(VIEW_H, VIEW_W, 3)` image before `from_torch`. Row 0 is the bottom of the screen.
+- World coordinates span `[0, PHYSICS_GRID_W * PHYSICS_CELL_SIZE)`. `camera.py` maps screen pixels to world via `cam_x/cam_y` (world-space bottom-left of the view) and `zoom`. Advanced PM views resample grids into the viewport with `grid_sample`, using normalised `[-1, 1]` coordinates from `mesh_renderer.build_view_grid()`.
 - The viewport is measured in **render cells** (`RENDER_CELL_SIZE` screen pixels each; `VIEW_W = WIDTH / RENDER_CELL_SIZE`), not pixels.
   - Any code that maps a render-cell index to world coordinates must multiply by `RENDER_CELL_SIZE` before dividing by `zoom`.
   - Anything drawn into the frame is sized in render cells.
