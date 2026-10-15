@@ -18,6 +18,7 @@
     "KERNEL_BACKEND": "auto",
     "TORCH_COMPILE": false,
     "SORT_INTERVAL": 50,
+    "FIELD_INTERVAL": 1,
     "PHYSICS_GRID_W": 2048,
     "PHYSICS_GRID_H": 2048,
     "PHYSICS_CELL_SIZE": 2.0,

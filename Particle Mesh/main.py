@@ -49,7 +49,9 @@ def _init_taichi():
     for arch in candidates:
         try:
             if arch == ti.cuda:
-                ti.init(arch=arch, device_memory_fraction=0.15)
+                # Taichi only holds small buffers here (particle state lives in torch), so a fixed 0.5 GB pool
+                # instead of 15% of VRAM gives torch 1-3 GB back on CUDA cards (AUDIT §8 F41)
+                ti.init(arch=arch, device_memory_GB=0.5)
             else:
                 ti.init(arch=arch)
             

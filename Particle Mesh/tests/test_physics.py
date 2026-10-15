@@ -141,8 +141,8 @@ def test_sorting_preserves_physics(make_engine):
         eng.G = 1.0
         eng.precompute_kernel()
     b.sort_particles()
-    cells = torch.floor(b.pos[:n, 1] / CS) * E.GRID_W + torch.floor(b.pos[:n, 0] / CS)
-    assert bool((cells[1:] >= cells[:-1]).all())
+    keys = b.sort_keys().to(torch.int32)                       # tile keys (int16 on the 2048^2 grid)
+    assert bool((keys[1:] >= keys[:-1]).all())
     a.step(0.01)
     b.step(0.01)
     assert (a.pm_solver.density_grid - b.pm_solver.density_grid).abs().max() < 1e-3

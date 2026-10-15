@@ -6,6 +6,7 @@ from potentials import PotentialsManager
 from nbody_solver import DirectNBodySolver
 from pm_solver import ParticleMeshSolver
 from kernels import make_backend
+from kernels_torch import _const as const_tensor
 
 WIDTH = CONFIG["display"]["WIDTH"]
 HEIGHT = CONFIG["display"]["HEIGHT"]
@@ -113,6 +114,22 @@ class SimulationEngine:
         self.step_count = 0
         # Pending slider-driven kernel rebuild (see request_kernel_rebuild)
         self._kernel_dirty_since = None
+        # Opt-in multi-rate PM: rebuild the field (deposit + FFT) every FIELD_INTERVAL steps; 1 = every step
+        self.field_interval = max(1, int(CONFIG["simulation"].get("FIELD_INTERVAL", 1)))
+        self._field_dirty = True       # particles added/removed or kernel changed since the last field solve
+        # Freshly spawned gravity disks waiting for their orbit speeds: (start, end, centre_x, centre_y, vel_mult).
+        # Applied inside step() from that step's own field, so spawning needs no second solve (AUDIT §8 F04).
+        self._pending_orbits = []
+        # Sort keys: index of the t x t-cell tile holding each particle. The finest tile whose count fits int16
+        # (8x8 cells on 2048^2); int16 argsort is ~1.7x faster than float cell keys (AUDIT §8 F13).
+        self._sort_tile = 1
+        while (math.ceil(GRID_W / self._sort_tile) * math.ceil(GRID_H / self._sort_tile) > 65536
+               and self._sort_tile < 16):
+            self._sort_tile *= 2
+        self._sort_tiles_x = math.ceil(GRID_W / self._sort_tile)
+        self._sort_tiles_y = math.ceil(GRID_H / self._sort_tile)
+        self._sort_key16 = self._sort_tiles_x * self._sort_tiles_y <= 65536
+        self._sort_alt = None          # swap buffers for the sort permutation (allocated on first sort)
 
         # Initialize helper managers and solvers
         self.pot_manager = PotentialsManager(GRID_W, GRID_H, PHYSICS_CELL_SIZE, self.device)
@@ -123,19 +140,33 @@ class SimulationEngine:
     def periodic(self):
         return self.boundary_mode == 'periodic'
 
+    def sort_keys(self, n=None):
+        """Row-major tile index of each active particle (int16 when the tile count fits, else int32)."""
+        n = self.num_active if n is None else n
+        t = self._sort_tile
+        tiles = (self.pos[:n] * (1.0 / (PHYSICS_CELL_SIZE * t))).to(torch.int32).clamp_(min=0)
+        tiles = torch.minimum(tiles, const_tensor((self._sort_tiles_x - 1, self._sort_tiles_y - 1),
+                                                  self.device, torch.int32))
+        key = tiles[:, 1] * self._sort_tiles_x + tiles[:, 0]
+        return (key - 32768).to(torch.int16) if self._sort_key16 else key
+
     def sort_particles(self):
         """
-        Reorders active particles by physics-grid cell. Memory-coherent CIC deposit/gather is ~2-4x faster.
+        Reorders active particles by grid tile. Memory-coherent CIC deposit/gather is ~2-4x faster. The permutation
+        is gathered straight into swap buffers (index_select out=), then the buffers are swapped: no copy back.
         """
         n = self.num_active
         if n < 2:
             return
-        cell_x = torch.floor(self.pos[:n, 0] / PHYSICS_CELL_SIZE).clamp_(0, GRID_W - 1)
-        cell_y = torch.floor(self.pos[:n, 1] / PHYSICS_CELL_SIZE).clamp_(0, GRID_H - 1)
-        order = torch.argsort(cell_y * GRID_W + cell_x)
-        self.pos[:n] = self.pos[:n][order]
-        self.vel[:n] = self.vel[:n][order]
-        self.masses[:n] = self.masses[:n][order]
+        order = torch.argsort(self.sort_keys(n))
+        if self._sort_alt is None:
+            self._sort_alt = (torch.empty_like(self.pos), torch.empty_like(self.vel), torch.empty_like(self.masses))
+        pos_alt, vel_alt, masses_alt = self._sort_alt
+        torch.index_select(self.pos[:n], 0, order, out=pos_alt[:n])
+        torch.index_select(self.vel[:n], 0, order, out=vel_alt[:n])
+        torch.index_select(self.masses[:n], 0, order, out=masses_alt[:n])
+        self._sort_alt = (self.pos, self.vel, self.masses)
+        self.pos, self.vel, self.masses = pos_alt, vel_alt, masses_alt
 
     def request_kernel_rebuild(self):
         """
@@ -150,6 +181,7 @@ class SimulationEngine:
         Triggers potentials precomputation inside solvers on parameter change.
         """
         self._kernel_dirty_since = None
+        self._field_dirty = True
         self.pm_solver.update_kernel(self.potential_type, self._physics_params())
 
     def capacity(self):
@@ -178,24 +210,40 @@ class SimulationEngine:
             'softening_length': self.softening_length
         }
 
-    def _set_orbital_velocities(self, start, end, world_x, world_y, vel_mult):
-        """
-        Gives particles start:end (a freshly spawned disk centred on world_x, world_y) the circular speed of the
-        field they actually feel (AUDIT 2.12): v = sqrt(r * a_inward), clockwise, times vel_mult. The acceleration
-        comes from a real field evaluation (PM field solve or direct N-body) including the new disk itself, any
-        existing particles, softening, force-range screening and periodic images, so no analytic approximation.
-        """
-        n = self.num_active
+    def _apply_pending_orbits(self, sample):
+        """Give every pending spawned disk its orbit speeds; sample(start, end) returns the field (ax, ay) there."""
+        for start, end, world_x, world_y, vel_mult in self._pending_orbits:
+            ax, ay = sample(start, end)
+            self._set_orbital_velocities(start, end, world_x, world_y, vel_mult, ax, ay)
+        self._pending_orbits.clear()
+
+    def _flush_pending_orbits(self):
+        """Apply pending orbit speeds right now with a separate field evaluation. Only needed when particles are
+        about to be reordered or erased before the next step (the normal path reuses the step's field)."""
+        if not self._pending_orbits:
+            return
         if self._kernel_dirty_since is not None:
             self.precompute_kernel()   # apply a pending slider change so speeds match the current G
+        n = self.num_active
         params = self._physics_params()
         if self.solver_type == 'nbody':
             ax, ay = self.nbody_solver.solve(self.pos[:n], self.masses[:n], 'gravity', params,
                                              self.periodic, self.universe_w, self.universe_h)
-            ax, ay = ax[start:end], ay[start:end]
+            self._apply_pending_orbits(lambda s, e: (ax[s:e], ay[s:e]))
         else:
-            ax, ay = self.pm_solver.accelerations_at(self.pos, self.masses, n, start, end, 'gravity', params,
-                                                     self.periodic, self.universe_w, self.universe_h)
+            s0, e0 = self._pending_orbits[0][:2]
+            self.pm_solver.accelerations_at(self.pos, self.masses, n, s0, e0, 'gravity', params,
+                                            self.periodic, self.universe_w, self.universe_h)
+            self._apply_pending_orbits(
+                lambda s, e: self.pm_solver.sample_forces(self.pos[s:e], self.universe_w, self.universe_h))
+
+    def _set_orbital_velocities(self, start, end, world_x, world_y, vel_mult, ax, ay):
+        """
+        Gives particles start:end (a freshly spawned disk centred on world_x, world_y) the circular speed of the
+        field they actually feel (AUDIT 2.12): v = sqrt(r * a_inward), clockwise, times vel_mult. (ax, ay) is the
+        field acceleration at those particles from a real field evaluation (the step's PM solve or direct N-body),
+        including the new disk itself, existing particles, softening, force-range screening and periodic images.
+        """
         d = self.pos[start:end] - torch.tensor([world_x, world_y], device=self.device)
         if self.periodic:
             size = torch.tensor([self.universe_w, self.universe_h], device=self.device, dtype=d.dtype)
@@ -239,12 +287,15 @@ class SimulationEngine:
         self.num_active += count
         if self.periodic:
             self.kernels.wrap(self.pos[start:end], count, self.universe_w, self.universe_h)
+        self._field_dirty = True
         if self.potential_type == 'gravity' and vel_mult != 0.0:
-            self._set_orbital_velocities(start, end, world_x, world_y, vel_mult)
+            self._pending_orbits.append((start, end, world_x, world_y, vel_mult))
 
     def remove_particles(self, world_x, world_y, world_radius):
         if self.num_active == 0:
             return
+        self._flush_pending_orbits()   # compaction below would invalidate their index ranges
+        self._field_dirty = True
         uni_pos = torch.tensor([world_x, world_y], dtype=torch.float32, device=self.device)
         distances = torch.norm(self.pos[:self.num_active] - uni_pos, dim=1)
         keep_mask = distances > world_radius
@@ -277,6 +328,7 @@ class SimulationEngine:
         self.vel[start:end] = 0.0
         self.masses[start:end] = self._new_masses(total_spawn)
         self.num_active += total_spawn
+        self._field_dirty = True
 
     def step(self, dt):
         if self._kernel_dirty_since is not None and time.perf_counter() - self._kernel_dirty_since >= KERNEL_REBUILD_DELAY:
@@ -284,70 +336,76 @@ class SimulationEngine:
         if self.num_active == 0:
             return
 
+        n = self.num_active
         # 1. Handle Boundaries. Periodic needs nothing here: positions are wrapped right after each drift
         # (no deletion, so no per-frame compaction or GPU->CPU sync).
         if self.boundary_mode == 'reflective_walls':
-            hit_left = self.pos[:self.num_active, 0] < 0
-            hit_right = self.pos[:self.num_active, 0] > self.universe_w
-            hit_top = self.pos[:self.num_active, 1] < 0
-            hit_bottom = self.pos[:self.num_active, 1] > self.universe_h
-            
-            self.pos[:self.num_active, 0] = torch.where(hit_left, 0.0, self.pos[:self.num_active, 0])
-            self.pos[:self.num_active, 0] = torch.where(hit_right, float(self.universe_w), self.pos[:self.num_active, 0])
-            self.vel[:self.num_active, 0] = torch.where(hit_left | hit_right, -self.vel[:self.num_active, 0] * 0.5, self.vel[:self.num_active, 0])
+            p = self.pos[:n]
+            v = self.vel[:n]
+            size = const_tensor((float(self.universe_w), float(self.universe_h)), self.device, p.dtype)
+            hit = (p < 0) | (p > size)
+            v.mul_(torch.where(hit, -0.5, 1.0))     # bounce with half restitution
+            p.clamp_(min=0.0)
+            torch.minimum(p, size, out=p)
 
-            self.pos[:self.num_active, 1] = torch.where(hit_top, 0.0, self.pos[:self.num_active, 1])
-            self.pos[:self.num_active, 1] = torch.where(hit_bottom, float(self.universe_h), self.pos[:self.num_active, 1])
-            self.vel[:self.num_active, 1] = torch.where(hit_top | hit_bottom, -self.vel[:self.num_active, 1] * 0.5, self.vel[:self.num_active, 1])
+        # Uniform background gravity, folded into the kick of either solver
+        uniform = (0.0, 0.0)
+        if self.uniform_gravity_mag > 0:
+            uniform = self.pot_manager.get_uniform_gravity_forces(self.uniform_gravity_mag, self.uniform_gravity_angle)
 
         # 2. Run Selected Physics Solver
         params = self._physics_params()
         if self.solver_type == 'nbody':
             ax, ay = self.nbody_solver.solve(
-                self.pos[:self.num_active],
-                self.masses[:self.num_active],
+                self.pos[:n],
+                self.masses[:n],
                 self.potential_type,
                 params,
                 self.periodic, self.universe_w, self.universe_h
             )
+            if self._pending_orbits:
+                self._apply_pending_orbits(lambda s, e: (ax[s:e], ay[s:e]))
 
             # Euler integration for velocity and positions (exponential friction decay never flips sign)
             damping = math.exp(-self.friction * dt)
-            self.vel[:self.num_active, 0] = (self.vel[:self.num_active, 0] + ax * dt) * damping
-            self.vel[:self.num_active, 1] = (self.vel[:self.num_active, 1] + ay * dt) * damping
-
-            self.pos[:self.num_active, 0] += self.vel[:self.num_active, 0] * dt
-            self.pos[:self.num_active, 1] += self.vel[:self.num_active, 1] * dt
+            self.vel[:n, 0] = (self.vel[:n, 0] + (ax + uniform[0]) * dt) * damping
+            self.vel[:n, 1] = (self.vel[:n, 1] + (ay + uniform[1]) * dt) * damping
+            self.pos[:n].add_(self.vel[:n], alpha=dt)
             if self.periodic:
-                self.kernels.wrap(self.pos, self.num_active, self.universe_w, self.universe_h)
+                self.kernels.wrap(self.pos, n, self.universe_w, self.universe_h)
 
         elif self.solver_type == 'pm':
-            if self.sort_interval > 0 and self.step_count % self.sort_interval == 0:
+            # Sort on schedule, but never while spawned disks still wait for their orbit speeds (index ranges)
+            if self.sort_interval > 0 and self.step_count % self.sort_interval == 0 and not self._pending_orbits:
                 self.sort_particles()
+            recompute = (self._field_dirty or self.field_interval <= 1
+                         or self.step_count % self.field_interval == 0)
+            hook = None
+            if self._pending_orbits:
+                hook = lambda solver: self._apply_pending_orbits(
+                    lambda s, e: solver.sample_forces(self.pos[s:e], self.universe_w, self.universe_h))
             self.pm_solver.solve(
-                self.pos, 
-                self.vel, 
-                self.masses, 
-                self.num_active, 
-                self.potential_type, 
-                params, 
-                dt, 
+                self.pos,
+                self.vel,
+                self.masses,
+                n,
+                self.potential_type,
+                params,
+                dt,
                 self.friction,
                 self.pressure_model,
                 self.pressure_strength,
                 self.gamma,
                 self.periodic,
                 self.universe_w,
-                self.universe_h
+                self.universe_h,
+                uniform_accel=uniform,
+                recompute_field=recompute,
+                before_gather=hook
             )
+            self._field_dirty = False
         self.step_count += 1
 
-        # 3. Apply Uniform Gravity Field (CUDA Accelerated)
-        if self.uniform_gravity_mag > 0:
-            ugx, ugy = self.pot_manager.get_uniform_gravity_forces(self.uniform_gravity_mag, self.uniform_gravity_angle)
-            self.vel[:self.num_active, 0] += ugx * dt
-            self.vel[:self.num_active, 1] += ugy * dt
-            
         # Apply fluid dampening cooling (if Lennard-Jones active in N-body mode)
         if self.potential_type == 'lennard_jones' and self.solver_type == 'nbody':
-            self.vel[:self.num_active] *= 0.99
+            self.vel[:n] *= 0.99
