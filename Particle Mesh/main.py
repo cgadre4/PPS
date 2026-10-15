@@ -1,5 +1,4 @@
 import taichi as ti
-import torch
 
 import math
 import time
@@ -25,24 +24,8 @@ from particle_mesh.physics.engine import SimulationEngine
 from particle_mesh.render.camera import SimulationCamera
 from particle_mesh.render.circle_renderer import CircleRenderer
 from particle_mesh.render.mesh_renderer import MeshRenderer
+from particle_mesh.render.overlays import BrushOverlay
 from particle_mesh.ui.panel import SimulationGUI
-
-# Brush ring and "show panel" arrow overlays. The fields are created in main() (after ti.init) and passed in.
-@ti.kernel
-def init_arrow(arrow_verts: ti.template()):
-    arrow_verts[0] = [0.016, 0.985]
-    arrow_verts[1] = [0.016, 0.965]
-    arrow_verts[2] = [0.006, 0.975]
-    arrow_verts[3] = [0.028, 0.985]
-    arrow_verts[4] = [0.028, 0.965]
-    arrow_verts[5] = [0.018, 0.975]
-
-@ti.kernel
-def update_brush_ring(ring_pos_field: ti.template(), center_x: ti.f32, center_y: ti.f32, radius_x: ti.f32, radius_y: ti.f32):
-    for i in range(ring_pos_field.shape[0]):
-        angle = float(i) / ring_pos_field.shape[0] * 2.0 * math.pi
-        ring_pos_field[i] = [center_x + ti.cos(angle) * radius_x, center_y + ti.sin(angle) * radius_y]
-
 
 class KeyEdges:
     """Per-frame key/button state with rising-edge detection (replaces hand-rolled prev_* flags)."""
@@ -72,9 +55,8 @@ def main():
     canvas = window.get_canvas()
     gui = window.get_gui()
 
-    ring_pos_field = ti.Vector.field(2, dtype=ti.f32, shape=64)
-    arrow_verts = ti.Vector.field(2, dtype=ti.f32, shape=6)
-    init_arrow(arrow_verts)
+    # Brush ring and "show panel" arrow overlays
+    brush = BrushOverlay()
 
     # Startup count and solver from the configuration (the engine caps N-body startup counts)
     engine = SimulationEngine(solver=SOLVER_MODE)
@@ -92,10 +74,6 @@ def main():
     circle_renderer = CircleRenderer()
     mesh_renderer = MeshRenderer(engine.kernels)
     sim_gui = SimulationGUI(engine, camera, CONFIG, palettes)
-
-    # N-body Coulomb circle colours (created once, not every frame)
-    positive_color = torch.tensor([255.0, 50.0, 50.0], device=engine.device)
-    negative_color = torch.tensor([50.0, 150.0, 255.0], device=engine.device)
 
     # Spawner Brush settings
     interaction_radius = SETTINGS.slider("brush_radius")[2]
@@ -238,44 +216,19 @@ def main():
         
         if engine.num_active > 0:
             if engine.solver_type == 'nbody':
-                # Dynamically color circles based on speed/charges in PyTorch VRAM
-                if engine.potential_type == 'coulomb':
-                    positive = (engine.masses[:engine.num_active] > 0).unsqueeze(1)
-                    color_tensor = torch.where(positive, positive_color, negative_color)
-                else:
-                    speed = torch.norm(engine.vel[:engine.num_active], dim=1)
-                    max_speed = 50.0
-                    norm_speed = torch.clamp(speed / max_speed, 0.0, 1.0)
-                    idx_f = norm_speed * 8.0
-                    idx_lower = torch.clamp(idx_f.long(), 0, 7)
-                    idx_upper = torch.clamp(idx_lower + 1, 0, 8)
-                    weight = (idx_f - idx_lower.float()).unsqueeze(1)
-                    color_tensor = active_map[idx_lower] * (1.0 - weight) + active_map[idx_upper] * weight
-
-                circle_renderer.render(
-                    canvas,
-                    engine.pos[:engine.num_active],
-                    color_tensor,
-                    engine.num_active,
-                    camera.cam_x, camera.cam_y,
-                    camera.width / camera.zoom, camera.height / camera.zoom, # Visible world extent
-                    0.0005 # Visual radius
-                )
-                
+                # Circles coloured by speed (or charge in Coulomb mode), computed on the sim device
+                circle_renderer.render_nbody(canvas, engine, camera, active_map)
             elif engine.solver_type == 'pm':
                 # Density / potential / band-pass view, FFT minimap and force arrows (see MeshRenderer.render_pm)
-                mesh_renderer.render_pm(canvas, engine, camera, active_map, sim_gui.ui_w)
+                mesh_renderer.render_pm(canvas, engine, camera, active_map, sim_gui.ui_w, view=engine.view)
 
         # Draw brush ring overlay
-        update_brush_ring(ring_pos_field, mouse_norm[0], mouse_norm[1], interaction_radius / float(WIDTH), interaction_radius / float(HEIGHT))
-        if rmb_pressed and not is_hovering_ui and not is_modifying_view:
-            canvas.circles(ring_pos_field, radius=0.001, color=(1.0, 0.2, 0.2))
-        else:
-            canvas.circles(ring_pos_field, radius=0.001, color=(0.2, 0.8, 0.6))
+        brush.draw_ring(canvas, mouse_norm, interaction_radius, WIDTH, HEIGHT,
+                        erasing=rmb_pressed and not is_hovering_ui and not is_modifying_view)
 
         # Draw Escape panel indicator if hidden
         if not ui_open:
-            canvas.triangles(arrow_verts, color=(0.8, 0.8, 0.8))
+            brush.draw_arrow(canvas)
         else:
             # Render imgui panels
             interaction_radius, spawn_vel, spawn_density = sim_gui.render(

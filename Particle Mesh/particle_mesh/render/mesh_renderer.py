@@ -1,11 +1,10 @@
 import math
-import numpy as np
 import taichi as ti
 import torch
-from taichi.ui.utils import get_field_info
 
 from particle_mesh.settings import SETTINGS
 from particle_mesh.runtime.device import to_taichi
+from particle_mesh.render.ggui_present import HostFramePresenter
 
 WIDTH = SETTINGS.width
 HEIGHT = SETTINGS.height
@@ -29,33 +28,7 @@ from particle_mesh.render.colormap import (  # noqa: E402,F401  (re-exported)
 )
 
 
-def build_view_grid(camera, universe_w, universe_h, device):
-    """
-    grid_sample coordinates that map every viewport render cell onto the physics grid.
-    Returns a (1, VIEW_H, VIEW_W, 2) tensor of normalised [-1, 1] coordinates (for align_corners=False).
-    """
-    grid_w = int(camera.width / RENDER_CELL_SIZE)
-    grid_h = int(camera.height / RENDER_CELL_SIZE)
-
-    screen_y, screen_x = torch.meshgrid(
-        torch.arange(grid_h, device=device, dtype=torch.float32),
-        torch.arange(grid_w, device=device, dtype=torch.float32),
-        indexing='ij'
-    )
-    # Render cell (gx, gy) covers screen pixels [gx, gx + 1) * RENDER_CELL_SIZE (same binning as splat_view);
-    # sample the physics grid at the world position of that cell's centre.
-    world_gx = (screen_x + 0.5) * RENDER_CELL_SIZE / camera.zoom + camera.cam_x
-    world_gy = (screen_y + 0.5) * RENDER_CELL_SIZE / camera.zoom + camera.cam_y
-
-    grid_x_norm = (world_gx / universe_w) * 2.0 - 1.0
-    grid_y_norm = (world_gy / universe_h) * 2.0 - 1.0
-    return torch.stack((grid_x_norm, grid_y_norm), dim=-1).unsqueeze(0)
-
-
-def _sample(grid, view_grid):
-    """grid_sample one (H, W) physics grid onto the viewport -> (VIEW_H, VIEW_W)."""
-    return torch.nn.functional.grid_sample(grid[None, None], view_grid, align_corners=False,
-                                           padding_mode='zeros')[0, 0]
+from particle_mesh.render.viewport import _sample, build_view_grid  # noqa: E402,F401  (re-exported)
 
 
 class MeshRenderer:
@@ -76,14 +49,10 @@ class MeshRenderer:
         self._thumb = None
         self._thumb_key = None
         self._frame = 0
-        # Presentation buffer: the finished frame as packed RGBA8 uint32 in GGUI's [x, y] layout, handed to GGUI
-        # as a host pointer (see _present). Pinned when the torch accelerator supports it (faster readback).
-        try:
-            self._host = torch.empty((VIEW_W, VIEW_H), dtype=torch.int32, pin_memory=True)
-        except RuntimeError:
-            self._host = torch.empty((VIEW_W, VIEW_H), dtype=torch.int32)
-        self._host_np = self._host.numpy().view(np.uint32)
-        self._host_info = get_field_info(self._host_np)
+        # Presentation: the finished frame goes to GGUI through one persistent (pinned) host buffer
+        self._presenter = HostFramePresenter(VIEW_W, VIEW_H)
+        self._host = self._presenter.host
+        self._host_np = self._presenter.host_np
         # Arrow vertex buffers (Taichi fields; created here, after ti.init, never at import)
         self.vector_verts = self.vector_colors = None
         if TOTAL_ARROWS > 0:
@@ -235,24 +204,8 @@ class MeshRenderer:
         self._present(canvas, colorize(view_dens_tensor.t(), color_map_tensor, min_log, max_log, float(scale)), overlay)
 
     def _present(self, canvas, image, overlay):
-        """
-        image: (VIEW_W, VIEW_H) packed RGBA8 int32 on the sim device, GGUI [x, y] layout, y = 0 at the bottom.
-
-        The frame is copied once into a persistent host buffer and handed to GGUI as a host-mapped uint32 image:
-        exactly what Taichi's own Canvas.set_image does after its to_rgba8 conversion, minus that conversion and
-        the field.from_torch upload (two Taichi kernel launches and two Vulkan waits per frame; AUDIT §8 F01).
-        """
-        if overlay is not None:
-            thumb, thumb_w, thumb_h = overlay
-            w, h = min(thumb_w, VIEW_W), min(thumb_h, VIEW_H)
-            image[:w, :h] = thumb[:w, :h]
-        self._host.copy_(image)
-        py_canvas = getattr(canvas, "canvas", None)
-        if py_canvas is not None and hasattr(py_canvas, "set_image"):
-            py_canvas.set_image(self._host_info)
-        else:  # public-API fallback (e.g. a future Taichi without the PyCanvas attribute)
-            rgb = np.ascontiguousarray(self._host_np.view(np.uint8).reshape(VIEW_W, VIEW_H, 4)[..., :3])
-            canvas.set_image(rgb)
+        """image: (VIEW_W, VIEW_H) packed RGBA8 int32 on the sim device (see HostFramePresenter.present)."""
+        self._presenter.present(canvas, image, overlay)
 
     def render_vectors(self, canvas, fx_grid, fy_grid, camera, universe_w, universe_h, color_map_tensor, min_log, max_log,
                        length_scale, head_size, head_angle, width):

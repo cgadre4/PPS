@@ -13,6 +13,41 @@ class CircleRenderer:
         # GGUI vertex buffers, created here (after ti.init) rather than at import
         self.render_pos_field = ti.Vector.field(2, dtype=ti.f32, shape=MAX_RENDER_PARTICLES)
         self.render_color_field = ti.Vector.field(3, dtype=ti.f32, shape=MAX_RENDER_PARTICLES)
+        self._charge_colors = None  # (positive, negative) Coulomb colours, created on the first Coulomb frame
+
+    def render_nbody(self, canvas, engine, camera, color_map):
+        """Draws an N-body frame: one circle per on-screen particle, coloured by speed (or by charge in Coulomb mode)."""
+        if engine.num_active == 0:
+            return
+        self.render(
+            canvas,
+            engine.pos[:engine.num_active],
+            self._nbody_colors(engine, color_map),
+            engine.num_active,
+            camera.cam_x, camera.cam_y,
+            camera.width / camera.zoom, camera.height / camera.zoom,  # Visible world extent
+            0.0005  # Visual radius
+        )
+
+    def _nbody_colors(self, engine, color_map):
+        """(N, 3) colours 0-255 on the sim device: red/blue for +/- charges in Coulomb mode, else the theme
+        gradient over speed (0 to 50 world units per time unit)."""
+        n = engine.num_active
+        if engine.potential_type == 'coulomb':
+            if self._charge_colors is None:
+                self._charge_colors = (torch.tensor([255.0, 50.0, 50.0], device=engine.device),
+                                       torch.tensor([50.0, 150.0, 255.0], device=engine.device))
+            positive_color, negative_color = self._charge_colors
+            positive = (engine.masses[:n] > 0).unsqueeze(1)
+            return torch.where(positive, positive_color, negative_color)
+        speed = torch.norm(engine.vel[:n], dim=1)
+        max_speed = 50.0
+        norm_speed = torch.clamp(speed / max_speed, 0.0, 1.0)
+        idx_f = norm_speed * 8.0
+        idx_lower = torch.clamp(idx_f.long(), 0, 7)
+        idx_upper = torch.clamp(idx_lower + 1, 0, 8)
+        weight = (idx_f - idx_lower.float()).unsqueeze(1)
+        return color_map[idx_lower] * (1.0 - weight) + color_map[idx_upper] * weight
 
     def render(self, canvas, pos_tensor, color_tensor, num_active, cam_x, cam_y, screen_w, screen_h, particle_radius):
         """
