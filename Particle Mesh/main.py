@@ -95,6 +95,30 @@ def update_brush_ring(center_x: ti.f32, center_y: ti.f32, radius_x: ti.f32, radi
         ring_pos_field[i] = [center_x + ti.cos(angle) * radius_x, center_y + ti.sin(angle) * radius_y]
 
 
+def build_view_grid(camera, universe_w, universe_h, device):
+    """
+    grid_sample coordinates that map every viewport render cell onto the physics grid.
+    Returns a (1, VIEW_H, VIEW_W, 2) tensor of normalised [-1, 1] coordinates (for align_corners=False).
+    """
+    render_cell_size = CONFIG["simulation"]["RENDER_CELL_SIZE"]
+    grid_w = int(camera.width / render_cell_size)
+    grid_h = int(camera.height / render_cell_size)
+
+    screen_y, screen_x = torch.meshgrid(
+        torch.arange(grid_h, device=device, dtype=torch.float32),
+        torch.arange(grid_w, device=device, dtype=torch.float32),
+        indexing='ij'
+    )
+    # Render cell (gx, gy) covers screen pixels [gx, gx + 1) * RENDER_CELL_SIZE (same binning as
+    # render_scatter_kernel); sample the physics grid at the world position of that cell's centre.
+    world_gx = (screen_x + 0.5) * render_cell_size / camera.zoom + camera.cam_x
+    world_gy = (screen_y + 0.5) * render_cell_size / camera.zoom + camera.cam_y
+
+    grid_x_norm = (world_gx / universe_w) * 2.0 - 1.0
+    grid_y_norm = (world_gy / universe_h) * 2.0 - 1.0
+    return torch.stack((grid_x_norm, grid_y_norm), dim=-1).unsqueeze(0)
+
+
 def main():
     # Setup Taichi GGUI Window
     window = ti.ui.Window("PyTorch + Taichi Flexible Physical Sandbox", (WIDTH, HEIGHT), vsync=False, pos=(0, 0))
@@ -376,20 +400,7 @@ def main():
 
                 # Perform grid sampling on GPU before rendering advanced views
                 if engine.show_potential or engine.use_bandpass_render or engine.show_field:
-                    grid_w = int(camera.width / CONFIG["simulation"]["RENDER_CELL_SIZE"])
-                    grid_h = int(camera.height / CONFIG["simulation"]["RENDER_CELL_SIZE"])
-                    
-                    screen_y, screen_x = torch.meshgrid(
-                        torch.arange(grid_h, device=engine.device, dtype=torch.float32), 
-                        torch.arange(grid_w, device=engine.device, dtype=torch.float32), 
-                        indexing='ij'
-                    )
-                    world_gx = (screen_x / camera.zoom) + camera.cam_x
-                    world_gy = (screen_y / camera.zoom) + camera.cam_y
-                    
-                    grid_x_norm = (world_gx / engine.universe_w) * 2.0 - 1.0
-                    grid_y_norm = (world_gy / engine.universe_h) * 2.0 - 1.0
-                    grid_transform = torch.stack((grid_x_norm, grid_y_norm), dim=-1).unsqueeze(0)
+                    grid_transform = build_view_grid(camera, engine.universe_w, engine.universe_h, engine.device)
 
                 if engine.show_potential:
                     phi_view = torch.abs(engine.pm_solver.phi).unsqueeze(0).unsqueeze(0)

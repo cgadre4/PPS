@@ -56,7 +56,8 @@ Frame loop (`main.py`): input handling -> brush spawn/erase -> `engine.step(dt)`
 
 - PyTorch grids (`density_grid`, `phi`, `fx`, `fy`, `k_sq`) are `[row=y, col=x]`, indexed `[j, i]` in Taichi kernels.
 - Taichi display fields (`display_pixels`, `visual_density`) are `[x, y]`; `MeshRenderer.render_grid` transposes before `from_torch`.
-- World coordinates span `[0, PHYSICS_GRID_W * PHYSICS_CELL_SIZE)`. `camera.py` maps screen pixels to world via `cam_x/cam_y` (world-space top-left) and `zoom`. Advanced PM views resample grids into the viewport with `grid_sample`, using normalised `[-1, 1]` coordinates computed in `main.py`.
+- World coordinates span `[0, PHYSICS_GRID_W * PHYSICS_CELL_SIZE)`. `camera.py` maps screen pixels to world via `cam_x/cam_y` (world-space top-left) and `zoom`. Advanced PM views resample grids into the viewport with `grid_sample`, using normalised `[-1, 1]` coordinates from `main.build_view_grid()`.
+- The viewport is measured in **render cells** (`RENDER_CELL_SIZE` screen pixels each; `VIEW_W = WIDTH / RENDER_CELL_SIZE`), not pixels. Any code that maps a render-cell index to world coordinates must multiply by `RENDER_CELL_SIZE` before dividing by `zoom`, and anything drawn into `display_pixels` is sized in render cells. The shipped config uses `RENDER_CELL_SIZE: 2`, so this bug class shows up immediately.
 
 ### Rendering
 
