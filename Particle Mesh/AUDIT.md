@@ -44,7 +44,7 @@ Since `show_fft` defaults to `True` (it isn't in `config.json`), every frame pay
 **Fix:** run the overlay before `set_image`. That means moving the PIP into `MeshRenderer` and drawing it between `render_color_kernel` and `set_image`. Also reuse the solver's `rho_k` (see 3.3) and refresh the thumbnail only every N frames.
 
 Smaller issues in the same block:
-- `interpolate(..., mode='bilinear')` without `antialias=True` aliases badly when shrinking 7680×3841 down to ~576×288.
+- `interpolate(..., mode='bilinear')` without `antialias=True` aliases badly when shrinking 7680×3841 down to ~576×288. *Fixed in PR #7* (`antialias=True`, which XPU supports).
 - The mirrored half is built with a horizontal flip only. For a real input, |F(−k)| = |F(k)| is a point reflection, so the left half should be flipped in both axes (after `fftshift`).
 
 ### 2.2 PM Coulomb ignores the sign of the charge (High)
@@ -131,6 +131,7 @@ The minimap size (`main.py:380-381`) is also in pixels but is written into a ren
 - Spawn speeds are `sqrt(G·M(<r)·(κr)K₁(κr))`, which includes the force-range screening.
 - The spawn-velocity slider is now a multiple of the orbit speed: range −2…2, default 1.
 - Measured: a 200k-particle disk keeps its median radius within 7% over 1 s (+20% by 2 s, from the screening approximation). At rest it collapses to 39%.
+- *PR #7:* replaced the analytic formula with the measured field, `v = sqrt(r·a_inward)`, from a real field solve (PM) or the N-body solver. Disks now hold their median radius within **0.5% over 2 s**, in both dense-core and uniform modes.
 
 `orbital_speed = sqrt(|G|·100/(r+10))` (`engine.py:131`) is an arbitrary profile. For the 2D PM law, the circular speed is `v² = G·M(<r)/(2π)`. For the "dense core" distribution (r uniform), M(<r) = count·r/R, so `v = sqrt(G·count·r/(2π·R))` (divided by cell_size² once 2.11 is fixed). The current formula makes disks either fly apart or collapse depending on brush size and density. `spawn_vel` then multiplies whatever the result is.
 
@@ -230,10 +231,10 @@ Every frame that a G, range, spring or LJ slider moves rebuilds the kernel. For 
 - **Two diverged copies.** At audit time, the June Google Drive copy and the August laptop copy had drifted apart, and neither was under version control. *Resolved:* the August copy is now this repo. The Google Drive copy (`GDrive\Documents\Scripts\PPS\Particle Mesh`) is stale; don't put a `.git` folder there, because Google Drive syncing can corrupt it.
 - **Relative `config.json` paths and import-time side effects.** `main.py`, `engine.py` and `mesh_renderer.py` each load the config with a relative path. `mesh_renderer.py` and `circle_renderer.py` allocate Taichi fields at import. One `config.py` with an absolute path (the August copy already does the path part) plus lazy field allocation would make the modules importable in tests.
   - *Status, PR #6:* `config.py` is now the only reader of `config.json`.
-  - Taichi fields are still allocated at import. The tests work around it by importing `main` first, so lazy allocation was left as is.
+  - *Status, PR #7:* fields are now created by their owners after `ti.init()`, so modules import in any order (`tests/test_imports.py`).
 - **`main.py` does too much.** Input handling, view resampling, colouring and overlays all live in one 420-line loop. Move the PM view and overlay logic into `MeshRenderer` (which also fixes 2.1), and keep the key edge-trigger state in a dict.
   - *Status, PR #6:* the PM views, minimap, bandpass and arrows moved into `MeshRenderer.render_pm`, and `main.py` dropped ~110 lines.
-  - The input edge-trigger variables were left as they are (cosmetic).
+  - *Status, PR #7:* the input edge-trigger flags are replaced by a `KeyEdges` helper.
 - **No tests.** *Resolved (PR #4 onwards): `tests/`, run with `uv run pytest`, all headless.* Taichi's `ti.cpu` arch plus CPU tensors runs the real kernels with zero-copy, so headless physics checks are cheap:
   - Two-body force against the analytic 2D law, for PM and N-body: this catches the 2π mismatch.
   - Total momentum stays ~0 for a symmetric configuration.
@@ -302,11 +303,24 @@ Native GPU kernels with atomics should be roughly as fast as the Taichi Vulkan n
 
 ## 6. Suggested order of work
 1. Consolidate into one git repo (§4).
-2. ~~Quick correctness fixes: 2.3 damping, 2.7 `K[0,0] = 0`, 2.2 Coulomb charge, 2.4 N-body zoom, 2.5 N-body cap, 2.1 overlay order.~~ **Done** on branch `fix/quick-correctness`. That branch also fixed the minimap's size when `RENDER_CELL_SIZE ≠ 1` and the point-reflection mirroring. Still open in 2.1: redundant FFTs (3.3) and antialiasing.
+2. ~~Quick correctness fixes: 2.3 damping, 2.7 `K[0,0] = 0`, 2.2 Coulomb charge, 2.4 N-body zoom, 2.5 N-body cap, 2.1 overlay order.~~ **Done** on branch `fix/quick-correctness`. That branch also fixed the minimap's size when `RENDER_CELL_SIZE ≠ 1` and the point-reflection mirroring. The redundant FFTs (3.3) were removed in PR #3; antialiasing is tracked in §7.
 3. ~~XPU option A, to get the app running on this laptop.~~ **Done** on branch `feat/xpu-port`. It adds a pure-PyTorch kernel backend with a shared CIC stencil, periodic cell sorting, all rendering in PyTorch, a 2048² grid, reuse of `rho_k`, a cached `K_eff` and a LUT colormap. Measured on the B390: 1M particles ≈ 17 ms/frame (≈59 FPS), 4M ≈ 42 ms. The old path took 115 ms for physics alone at 1M. CUDA machines keep the Taichi kernels via `kernels.TaichiBackend`; that path is parity-tested on Taichi CPU but not run on CUDA here.
 4. Install MSVC Build Tools and move to option B (Triton fused particle kernel). The hot paths are already isolated in `kernels_torch.py`, and `TORCH_COMPILE: true` will try `torch.compile` and fall back to eager if it fails. Benchmark against the numbers in step 3.
 5. ~~Boundary model (2.8), pressure form (2.9), units and parity (2.11), and a small physics test suite.~~ **Done:** 2.8 in PR #3, the test suite in PR #4, 2.9/2.11/2.12 in PR #5. The cleanup items (6, 2.13, 3.1, 3.5, 3.6, §4) are in PR #6.
 
-**Remaining:** only option B (fused Triton kernels, item 11's last part). It's blocked until Visual Studio 2022 Build Tools are installed.
-
 The benchmarks were run with throwaway scripts (`bench_xpu.py`, `bench_xpu2.py`, `test_set_image_order.py`) that are not committed. Ask for them to be re-created under a `bench/` folder if needed.
+
+---
+
+## 7. Remaining work (partials and loose ends)
+
+Everything still open after PRs #1–#6, in the order it's being done. Option B is deliberately last.
+
+| # | Item | Source | Status |
+|---|---|---|---|
+| 1 | Stale docs: config loading, slider rebuilds, N-body tiling, `build_view_grid` location, "redundant FFTs still open" | AGENTS.md, §6 | Done (PR #7) |
+| 2 | FFT minimap shrinks without antialiasing | 2.1 | Done (PR #7) |
+| 3 | Spawned galaxies drift (+20% radius by 2 s) because the screening formula is an approximation | 2.12 | Done (PR #7) |
+| 4 | Six hand-rolled `prev_*` key edge-trigger flags in `main.py` | §4 | Done (PR #7) |
+| 5 | Taichi fields allocated at import, forcing `ti.init()` before imports | §4 | Done (PR #7) |
+| 6 | **Option B: fused Triton / `torch.compile` particle kernels** (item 11's remaining part) | 5.4, 3.2 | Deferred: needs Visual Studio 2022 Build Tools |

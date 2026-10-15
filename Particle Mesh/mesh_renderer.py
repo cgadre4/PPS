@@ -12,19 +12,11 @@ RENDER_CELL_SIZE = CONFIG["simulation"]["RENDER_CELL_SIZE"]
 VIEW_W = int(WIDTH / RENDER_CELL_SIZE)
 VIEW_H = int(HEIGHT / RENDER_CELL_SIZE)
 
-# --- TAICHI NATIVE FIELDS (GGUI presentation only; all image math happens in PyTorch on the sim device) ---
-display_pixels = ti.Vector.field(3, dtype=ti.u8, shape=(VIEW_W, VIEW_H))
-
-# --- Vector Arrow Field Allocation ---
-PIXELS_PER_ARROW = CONFIG["display"].get("pixels_per_arrow", 32)  # spacing in render cells
+# --- Vector arrow grid (spacing in render cells) ---
+PIXELS_PER_ARROW = CONFIG["display"].get("pixels_per_arrow", 32)
 NUM_ARROWS_X = VIEW_W // PIXELS_PER_ARROW
 NUM_ARROWS_Y = VIEW_H // PIXELS_PER_ARROW
 TOTAL_ARROWS = NUM_ARROWS_X * NUM_ARROWS_Y
-
-if TOTAL_ARROWS > 0:
-    # Each arrow has 6 vertices (3 lines: shaft, left wing, right wing)
-    vector_verts = ti.Vector.field(2, dtype=ti.f32, shape=TOTAL_ARROWS * 6)
-    vector_colors = ti.Vector.field(3, dtype=ti.f32, shape=TOTAL_ARROWS * 6)
 
 
 def _gradient(norm, color_map):
@@ -95,6 +87,14 @@ class MeshRenderer:
         self.kernels = kernels  # particle backend; provides splat_view on the sim device
         self._bandpass = None
         self._bandpass_key = None
+        # Taichi fields for GGUI presentation only (all image math happens in PyTorch on the sim device).
+        # Created here, not at import, so this module can be imported before ti.init().
+        self.display_pixels = ti.Vector.field(3, dtype=ti.u8, shape=(VIEW_W, VIEW_H))
+        self.vector_verts = self.vector_colors = None
+        if TOTAL_ARROWS > 0:
+            # Each arrow has 6 vertices (3 lines: shaft, left wing, right wing)
+            self.vector_verts = ti.Vector.field(2, dtype=ti.f32, shape=TOTAL_ARROWS * 6)
+            self.vector_colors = ti.Vector.field(3, dtype=ti.f32, shape=TOTAL_ARROWS * 6)
 
     def bandpass_mask(self, k_sq, inner, outer, transition):
         """Smooth radial band-pass in |k| (rfft2 layout), cached until the sliders or the grid change."""
@@ -115,8 +115,11 @@ class MeshRenderer:
         Grayscale log-magnitude spectrum, size x size render cells, DC at the centre.
         Returns an overlay tuple (uint8 tensor, width, height) for render()/render_grid().
         """
+        # antialias=True low-pass filters while shrinking (e.g. 2048x1025 -> 216x108); plain bilinear sampling
+        # would alias fine spectral detail into moire (AUDIT 2.1)
         thumb_half = torch.nn.functional.interpolate(
-            (torch.abs(rho_k) * mask)[None, None], size=(size, size // 2), mode='bilinear', align_corners=False
+            (torch.abs(rho_k) * mask)[None, None], size=(size, size // 2), mode='bilinear', align_corners=False,
+            antialias=True
         )[0, 0]
         thumb_half = torch.fft.fftshift(torch.log1p(thumb_half), dim=0)
         # Real input: |F(-kx, -ky)| = |F(kx, ky)|, so the negative-kx half is a point reflection
@@ -195,8 +198,8 @@ class MeshRenderer:
             h, w = min(thumb_h, VIEW_H), min(thumb_w, VIEW_W)
             image[:h, :w] = thumb_tensor[:h, :w].unsqueeze(-1)
         # display_pixels is indexed [x, y]; one device->host copy of the finished frame when memory isn't shared
-        display_pixels.from_torch(to_taichi(image.transpose(0, 1).contiguous()))
-        canvas.set_image(display_pixels)
+        self.display_pixels.from_torch(to_taichi(image.transpose(0, 1).contiguous()))
+        canvas.set_image(self.display_pixels)
 
     def render_vectors(self, canvas, view_fx, view_fy, color_map_tensor, min_log, max_log, length_scale, head_size, head_angle, width):
         """
@@ -239,6 +242,6 @@ class MeshRenderer:
         verts = torch.stack((sx, sy, ex, ey, ex, ey, wx1, wy1, ex, ey, wx2, wy2), dim=-1).reshape(-1, 2)
         vert_colors = colors.unsqueeze(2).expand(-1, -1, 6, -1).reshape(-1, 3)
 
-        vector_verts.from_torch(to_taichi(verts.contiguous()))
-        vector_colors.from_torch(to_taichi(vert_colors.contiguous()))
-        canvas.lines(vector_verts, width=width, per_vertex_color=vector_colors)
+        self.vector_verts.from_torch(to_taichi(verts.contiguous()))
+        self.vector_colors.from_torch(to_taichi(vert_colors.contiguous()))
+        canvas.lines(self.vector_verts, width=width, per_vertex_color=self.vector_colors)

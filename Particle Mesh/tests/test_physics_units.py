@@ -88,20 +88,38 @@ def test_pressure_in_coulomb_mode_ignores_charge_sign(make_engine):
 
 
 @pytest.mark.parametrize("vel_mult,expect_stable", [(1.0, True), (0.0, False)])
-def test_spawned_galaxy_equilibrium(make_engine, vel_mult, expect_stable):
-    """A disk spawned at the circular speed keeps its size; one spawned at rest collapses."""
+@pytest.mark.parametrize("uniform_spawn", [False, True], ids=["dense_core", "uniform_disk"])
+def test_spawned_galaxy_equilibrium(make_engine, vel_mult, expect_stable, uniform_spawn):
+    """A disk spawned at the measured circular speed keeps its size (within 10% over 2 s, checked every
+    0.5 s); one spawned at rest collapses."""
     eng = make_engine(0)
     eng.friction = 0.0
+    eng.uniform_spawn = uniform_spawn
     eng.precompute_kernel()
     cx, cy = E.UNIVERSE_W / 2.0, E.UNIVERSE_H / 2.0
     eng.add_galaxy(cx, cy, 300.0, count=200000, vel_mult=vel_mult)
     centre = torch.tensor([cx, cy], device=eng.device)
     r0 = (eng.pos[:eng.num_active] - centre).norm(dim=1).median().item()
-    for _ in range(120):
+    ratios = []
+    for i in range(240):
         eng.step(1.0 / 120.0)
-    r1 = (eng.pos[:eng.num_active] - centre).norm(dim=1).median().item()
-    ratio = r1 / r0
+        if (i + 1) % 60 == 0:
+            ratios.append((eng.pos[:eng.num_active] - centre).norm(dim=1).median().item() / r0)
     if expect_stable:
-        assert 0.8 < ratio < 1.25, f"median radius ratio {ratio:.3f}"
+        assert all(0.9 < q < 1.1 for q in ratios), f"median radius ratios {[round(q, 3) for q in ratios]}"
     else:
-        assert ratio < 0.8, f"median radius ratio {ratio:.3f}"
+        assert min(ratios) < 0.8, f"median radius ratios {[round(q, 3) for q in ratios]}"
+
+
+def test_nbody_galaxy_equilibrium(make_engine):
+    """Same equilibrium in direct N-body mode (velocities from the N-body field)."""
+    eng = make_engine(0, 'nbody')
+    eng.friction = 0.0
+    cx, cy = E.UNIVERSE_W / 2.0, E.UNIVERSE_H / 2.0
+    eng.add_galaxy(cx, cy, 300.0, count=5000, vel_mult=1.0)
+    centre = torch.tensor([cx, cy], device=eng.device)
+    r0 = (eng.pos[:eng.num_active] - centre).norm(dim=1).median().item()
+    for _ in range(60):
+        eng.step(1.0 / 120.0)
+    ratio = (eng.pos[:eng.num_active] - centre).norm(dim=1).median().item() / r0
+    assert 0.9 < ratio < 1.1, f"median radius ratio {ratio:.3f}"

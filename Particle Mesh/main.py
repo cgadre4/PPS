@@ -19,7 +19,9 @@ HEIGHT = CONFIG["display"]["HEIGHT"]
 FPS_TARGET = CONFIG["display"]["FPS_TARGET"]
 SOLVER_MODE = CONFIG["simulation"].get("SOLVER", "pm").lower()
 
-# Initialize Taichi BEFORE importing renderers or GUI (since they declare fields at module-import time)
+# Taichi is initialised when this module is imported (tests and tools rely on `import main` doing it). Modules no
+# longer allocate fields at import, so import order is free; ti.init() just has to run before an engine or renderer
+# is constructed (kernels.make_backend reads the active arch, renderers create their fields).
 def _init_taichi():
     preferred = CONFIG.get("simulation", {}).get("TAICHI_BACKEND", None)
     arch_map = {
@@ -75,12 +77,9 @@ from circle_renderer import CircleRenderer
 from mesh_renderer import MeshRenderer, build_view_grid  # noqa: F401  (build_view_grid re-exported for tools/tests)
 from gui import SimulationGUI
 
-# Setup GGUI Fields for brush rings and arrow signs
-ring_pos_field = ti.Vector.field(2, dtype=ti.f32, shape=64)
-arrow_verts = ti.Vector.field(2, dtype=ti.f32, shape=6)
-
+# Brush ring and "show panel" arrow overlays. The fields are created in main() (after ti.init) and passed in.
 @ti.kernel
-def init_arrow():
+def init_arrow(arrow_verts: ti.template()):
     arrow_verts[0] = [0.016, 0.985]
     arrow_verts[1] = [0.016, 0.965]
     arrow_verts[2] = [0.006, 0.975]
@@ -89,10 +88,31 @@ def init_arrow():
     arrow_verts[5] = [0.018, 0.975]
 
 @ti.kernel
-def update_brush_ring(center_x: ti.f32, center_y: ti.f32, radius_x: ti.f32, radius_y: ti.f32):
-    for i in range(64):
-        angle = float(i) / 64.0 * 2.0 * math.pi
+def update_brush_ring(ring_pos_field: ti.template(), center_x: ti.f32, center_y: ti.f32, radius_x: ti.f32, radius_y: ti.f32):
+    for i in range(ring_pos_field.shape[0]):
+        angle = float(i) / ring_pos_field.shape[0] * 2.0 * math.pi
         ring_pos_field[i] = [center_x + ti.cos(angle) * radius_x, center_y + ti.sin(angle) * radius_y]
+
+
+class KeyEdges:
+    """Per-frame key/button state with rising-edge detection (replaces hand-rolled prev_* flags)."""
+
+    def __init__(self, window, keys):
+        self.window = window
+        self.keys = tuple(keys)
+        self.now = dict.fromkeys(self.keys, False)
+        self.before = dict(self.now)
+
+    def update(self):
+        self.before = self.now
+        self.now = {k: bool(self.window.is_pressed(k)) for k in self.keys}
+
+    def held(self, key):
+        return self.now[key]
+
+    def pressed(self, key):
+        """True only on the frame the key goes down."""
+        return self.now[key] and not self.before[key]
 
 
 
@@ -102,7 +122,9 @@ def main():
     canvas = window.get_canvas()
     gui = window.get_gui()
 
-    init_arrow()
+    ring_pos_field = ti.Vector.field(2, dtype=ti.f32, shape=64)
+    arrow_verts = ti.Vector.field(2, dtype=ti.f32, shape=6)
+    init_arrow(arrow_verts)
 
     # Determine safe startup active particle count from configuration
     initial_particles = CONFIG["simulation"].get("initial_particles", 1000000)
@@ -156,14 +178,9 @@ def main():
     spawn_vel = CONFIG["sliders"]["spawn_velocity"][2]
     spawn_density = CONFIG["sliders"]["spawn_density"][2]
 
-    # Key Edge-trigger tracking
-    prev_right = False
-    prev_left = False
-    prev_p = False
-    prev_f = False
-    prev_r = False
-    prev_m = False
-    prev_lmb = False
+    # Keyboard / mouse button state with edge detection
+    keys = KeyEdges(window, ('z', 'p', 'f', 'r', 'm', ti.ui.SPACE, ti.ui.RIGHT, ti.ui.LEFT, ti.ui.UP, ti.ui.DOWN,
+                             ti.ui.LMB, ti.ui.RMB, ti.ui.MMB))
 
     # Drag tracking states
     prev_pan_active = False
@@ -195,35 +212,23 @@ def main():
             last_time = current_time
 
         # Capture key states
-        z_pressed = window.is_pressed('z')
-        space_pressed = window.is_pressed(ti.ui.SPACE)
-        right_pressed = window.is_pressed(ti.ui.RIGHT)
-        left_pressed = window.is_pressed(ti.ui.LEFT)
-        p_pressed = window.is_pressed('p')
-        f_pressed = window.is_pressed('f')
-        r_pressed = window.is_pressed('r')
-        m_pressed = window.is_pressed('m')
+        keys.update()
+        z_pressed = keys.held('z')
+        space_pressed = keys.held(ti.ui.SPACE)
 
         # Keyboard Toggles (Edge-Triggered)
-        if right_pressed and not prev_right:
+        if keys.pressed(ti.ui.RIGHT):
             engine.color_theme = (engine.color_theme + 1) % len(engine.theme_names)
-        if left_pressed and not prev_left:
+        if keys.pressed(ti.ui.LEFT):
             engine.color_theme = (engine.color_theme - 1) % len(engine.theme_names)
-        if p_pressed and not prev_p and engine.solver_type == 'pm':
+        if keys.pressed('p') and engine.solver_type == 'pm':
             engine.show_potential = not engine.show_potential
-        if f_pressed and not prev_f and engine.solver_type == 'pm':
+        if keys.pressed('f') and engine.solver_type == 'pm':
             engine.show_field = not engine.show_field
-        if r_pressed and not prev_r:
+        if keys.pressed('r'):
             camera.reset()
-        if m_pressed and not prev_m:
+        if keys.pressed('m'):
             ui_open = not ui_open
-
-        prev_right = right_pressed
-        prev_left = left_pressed
-        prev_p = p_pressed
-        prev_f = f_pressed
-        prev_r = r_pressed
-        prev_m = m_pressed
 
         # Key events. (Taichi 1.7 GGUI reports no mouse-wheel events, so zoom and brush size use drags/keys.)
         mouse_norm = window.get_cursor_pos()
@@ -232,15 +237,15 @@ def main():
                 window.running = False
 
         # Keyboard Pan/Zoom fallbacks
-        if window.is_pressed(ti.ui.UP):
+        if keys.held(ti.ui.UP):
             camera.zoom_around_mouse(mouse_norm[0] * WIDTH, mouse_norm[1] * HEIGHT, 1.02)
-        if window.is_pressed(ti.ui.DOWN):
+        if keys.held(ti.ui.DOWN):
             camera.zoom_around_mouse(mouse_norm[0] * WIDTH, mouse_norm[1] * HEIGHT, 1.0 / 1.02)
 
         # Mouse Click/Drag events
-        lmb_pressed = window.is_pressed(ti.ui.LMB)
-        rmb_pressed = window.is_pressed(ti.ui.RMB)
-        mmb_pressed = window.is_pressed(ti.ui.MMB)
+        lmb_pressed = keys.held(ti.ui.LMB)
+        rmb_pressed = keys.held(ti.ui.RMB)
+        mmb_pressed = keys.held(ti.ui.MMB)
 
         # Panning Action
         pan_active = (lmb_pressed and space_pressed) or mmb_pressed
@@ -281,7 +286,7 @@ def main():
             if mouse_norm[0] <= 0.04 and mouse_norm[1] >= 0.95:
                 is_hovering_ui = True
 
-        if lmb_pressed and not prev_lmb:
+        if keys.pressed(ti.ui.LMB):
             if not ui_open and mouse_norm[0] <= 0.04 and mouse_norm[1] >= 0.95:
                 ui_open = True
 
@@ -297,8 +302,6 @@ def main():
             engine.add_galaxy(world_x, world_y, world_radius, count=spawn_count, vel_mult=spawn_vel)
         if rmb_pressed and not is_modifying_view and not is_hovering_ui:
             engine.remove_particles(world_x, world_y, world_radius)
-
-        prev_lmb = lmb_pressed
 
         # Step Simulation
         engine.step(dt)
@@ -340,7 +343,7 @@ def main():
                 mesh_renderer.render_pm(canvas, engine, camera, active_map, sim_gui.ui_w)
 
         # Draw brush ring overlay
-        update_brush_ring(mouse_norm[0], mouse_norm[1], interaction_radius / float(WIDTH), interaction_radius / float(HEIGHT))
+        update_brush_ring(ring_pos_field, mouse_norm[0], mouse_norm[1], interaction_radius / float(WIDTH), interaction_radius / float(HEIGHT))
         if rmb_pressed and not is_hovering_ui and not is_modifying_view:
             canvas.circles(ring_pos_field, radius=0.001, color=(1.0, 0.2, 0.2))
         else:
