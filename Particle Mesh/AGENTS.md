@@ -2,6 +2,16 @@
 
 Guidance for AI coding agents working in this repository.
 
+## Rule: no actions without "execute"
+
+You may read files and answer questions freely. Anything that changes state needs the user to say **"execute"** first. That includes:
+- editing or creating files;
+- running scripts, tests or the app;
+- installing packages;
+- any git or GitHub action (commit, push, branch, PR, merge).
+
+"Execute" approves the most recently proposed plan. If the plan changes, propose it again and wait for another "execute".
+
 ## What this is
 
 An interactive, GPU-accelerated 2D particle physics sandbox (gravity, Lennard-Jones, mutual springs, Coulomb). PyTorch holds particle state, does the FFT/field math, and builds every rendered frame on the simulation device. Taichi provides the GGUI window, the ImGui panel and the vertex/image buffers. On machines where Taichi can share memory with PyTorch, it also runs the particle kernels.
@@ -23,7 +33,15 @@ uv run python main.py
     - `taichi` when Taichi shares memory with the torch device (torch CUDA + Taichi CUDA, or torch CPU + Taichi CPU);
     - `torch` otherwise. The development laptop (Intel Arc B390) uses torch XPU + Taichi Vulkan, so it gets `torch`.
     - Override with `simulation.KERNEL_BACKEND`.
-- There is no build step, test suite or linter. Verify changes by running the app. The headless verification approach is to wrap `ti.ui.Window` with `show_window=False`, stub the input methods, and read `get_image_buffer_as_numpy()`. Don't call `window.show()` without a visible window; it crashes.
+- **Tests:** `uv run pytest` from this folder (~40 s, all headless). Run the suite before and after any change.
+  - `test_kernels.py`: torch vs Taichi backend parity.
+  - `test_physics.py`: audit-bug regressions and periodic behaviour.
+  - `test_rendering.py`: frame contents and view alignment.
+  - `test_smoke.py`: full `main.main()` loop per mode, each in a subprocess via `tests/headless_main.py`.
+- **Benchmark:** `uv run python tools/bench_frame.py [1e6 4e6 ...]` reports step and render milliseconds with the app's backend selection. Compare before and after performance changes.
+- **Headless technique:** wrap `ti.ui.Window` with `show_window=False`, stub the input methods, and read `get_image_buffer_as_numpy()`. Don't call `window.show()` without a visible window; it crashes. GGUI supports one window per process.
+- There is no build step or linter.
+- Don't set `PYTORCH_CUDA_ALLOC_CONF`/expandable segments for non-CUDA builds. PyTorch applies it to XPU too, and it measured ~15-20% slower (`main.py` only sets it when `torch.version.cuda`).
 - In `nbody` mode, `simulation.NBODY_MAX_PARTICLES` (default 10,000) caps both the startup count and brush/image spawning (`SimulationEngine.capacity()`), because the solver builds dense N×N tensors (~4 GB at 10k).
 
 ### Intel XPU rule: never pass XPU tensors to Taichi kernels

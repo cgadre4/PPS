@@ -1,9 +1,13 @@
 import os
-# Premium hardware memory allocation configuration (prevents VRAM fragmentation on Windows CUDA)
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 import taichi as ti
 import torch
+
+# Expandable segments reduce VRAM fragmentation on CUDA. Only set it for CUDA builds: newer PyTorch applies the
+# same setting to Intel XPU, where it measured ~15-20% slower. The allocator reads it at its first allocation,
+# so setting it here (after import, before any tensor) still takes effect.
+if torch.version.cuda:
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import math
 import time
 import json

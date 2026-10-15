@@ -12,23 +12,23 @@ Severity: **High** = wrong results, crash, or a feature that silently does nothi
 
 ## 1. Top findings
 
-| # | Sev | Finding | Where |
-|---|-----|---------|-------|
-| 1 | High | The FFT minimap is never displayed, but it is still computed every frame (on by default). **Verified.** | `main.py:365-394`, `mesh_renderer.py:175,185` |
-| 2 | High | Coulomb in PM mode ignores the particle's own charge, so + and − particles accelerate identically. | `pm_solver.py:47-51` |
-| 3 | High | Friction factor `(1 - friction*dt)` goes negative at high friction × time scale and blows up the velocities. | `pm_solver.py:50-51`, `engine.py:229-230` |
-| 4 | High | N-body view ignores zoom: the culling and normalisation use screen pixels as world units. | `main.py:270-278`, `circle_renderer.py:21-22,46-47` |
-| 5 | High | N-body mode has no particle cap after startup. One brush stroke spawns ~785k particles, which needs terabytes for the N×N matrices, so it OOMs or hangs. | `main.py:61-64,234-237`, `nbody_solver.py:24-39` |
-| 6 | High | Mouse-wheel zoom and brush resize are dead code: Taichi 1.7.4 GGUI emits no wheel events. **Verified in source.** | `main.py:166-172` |
-| 7 | Medium | The k=0 (mean) mode of the potential isn't zeroed. That adds a huge constant to φ, which wrecks float32 precision at large force range and washes out the potential view. | `potentials.py:39-47,79-88` |
-| 8 | Medium | ~~Forces are periodic (FFT) but particles are deleted at the edges, not wrapped. Mass near one edge pulls particles at the opposite edge. The GUI calls this mode "UNIVERSE WRAPPED".~~ Fixed (XPU port): truly periodic. | `engine.py:198-206`, `gui.py:113` |
-| 9 | Medium | Pressure is applied as acceleration `-P∇ρ^γ` rather than `-∇P/ρ`, so it explodes in dense regions. | `potentials.py:106-115` |
-| 10 | Medium | ~~Potential, field and bandpass views are wrong whenever `RENDER_CELL_SIZE ≠ 1` (the local `config.json` uses 2).~~ Fixed. | `main.py:283-296,380-381` |
-| 11 | Medium | Particle data is read 3–4 times per frame plus a GPU sync. At 100M particles that is about 6–7 GB of memory traffic per frame. | `engine.py:199-206`, `pm_solver.py`, `mesh_renderer.py:37-46` |
-| 12 | Medium | About 1 GB of redundant precomputed grids, and the kernel is stored as full complex when only half is used. | `potentials.py:12-25`, `pm_solver.py:69-74` |
-| 13 | High (XPU) | ~~The August Arc port passes XPU tensors into Taichi Vulkan kernels. Taichi copies every argument to the CPU and back on every call. **Verified, measured.**~~ Fixed (XPU port): torch kernel backend on XPU. | `C:\Python Dev\PPS\Particle Mesh\pm_solver.py` |
-| 14 | Medium (XPU) | ~~The port's Vulkan Poisson fallback (12 red-black Gauss-Seidel sweeps) is far from converged, so its gravity is effectively ~12-cell range.~~ Removed (XPU port): FFT on every device. | same |
-| 15 | Low | Two diverged copies of the project, and neither is under working version control. | — |
+| # | Sev | Finding | Where | Status |
+|---|-----|---------|-------|--------|
+| 1 | High | The FFT minimap is never displayed, but it is still computed every frame (on by default). **Verified.** | `main.py:365-394`, `mesh_renderer.py:175,185` | Done (PR #1) |
+| 2 | High | Coulomb in PM mode ignores the particle's own charge, so + and − particles accelerate identically. | `pm_solver.py:47-51` | Done (PR #1) |
+| 3 | High | Friction factor `(1 - friction*dt)` goes negative at high friction × time scale and blows up the velocities. | `pm_solver.py:50-51`, `engine.py:229-230` | Done (PR #1) |
+| 4 | High | N-body view ignores zoom: the culling and normalisation use screen pixels as world units. | `main.py:270-278`, `circle_renderer.py:21-22,46-47` | Done (PR #1) |
+| 5 | High | N-body mode has no particle cap after startup. One brush stroke spawns ~785k particles, which needs terabytes for the N×N matrices, so it OOMs or hangs. | `main.py:61-64,234-237`, `nbody_solver.py:24-39` | Done (PR #1) |
+| 6 | High | Mouse-wheel zoom and brush resize are dead code: Taichi 1.7.4 GGUI emits no wheel events. **Verified in source.** | `main.py:166-172` | Open |
+| 7 | Medium | The k=0 (mean) mode of the potential isn't zeroed. That adds a huge constant to φ, which wrecks float32 precision at large force range and washes out the potential view. | `potentials.py:39-47,79-88` | Done (PR #1) |
+| 8 | Medium | Forces are periodic (FFT) but particles are deleted at the edges, not wrapped. Mass near one edge pulls particles at the opposite edge. The GUI calls this mode "UNIVERSE WRAPPED". | `engine.py:198-206`, `gui.py:113` | Done (PR #3) |
+| 9 | Medium | Pressure is applied as acceleration `-P∇ρ^γ` rather than `-∇P/ρ`, so it explodes in dense regions. | `potentials.py:106-115` | Open |
+| 10 | Medium | Potential, field and bandpass views are wrong whenever `RENDER_CELL_SIZE ≠ 1` (the local `config.json` uses 2). | `main.py:283-296,380-381` | Done (PR #1, #2) |
+| 11 | Medium | Particle data is read 3–4 times per frame plus a GPU sync. At 100M particles that is about 6–7 GB of memory traffic per frame. | `engine.py:199-206`, `pm_solver.py`, `mesh_renderer.py:37-46` | Partial (PR #3): sync removed, cell sorting and a shared CIC stencil added; the single fused kernel is option B |
+| 12 | Medium | About 1 GB of redundant precomputed grids, and the kernel is stored as full complex when only half is used. | `potentials.py:12-25`, `pm_solver.py:69-74` | Partial (PR #3): softened kernel cached; duplicate grids and full-complex `K_k` remain |
+| 13 | High (XPU) | The August Arc port passes XPU tensors into Taichi Vulkan kernels. Taichi copies every argument to the CPU and back on every call. **Verified, measured.** | `pm_solver.py` (August copy) | Done (PR #3) |
+| 14 | Medium (XPU) | The port's Vulkan Poisson fallback (12 red-black Gauss-Seidel sweeps) is far from converged, so its gravity is effectively ~12-cell range. | same | Done (PR #3, removed) |
+| 15 | Low | Two diverged copies of the project, and neither is under working version control. | — | Done (repo `cgadre4/PPS`) |
 
 ---
 
