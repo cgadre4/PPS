@@ -1,6 +1,5 @@
 import math
 import glob
-import torch
 from particle_mesh.ui.image_loader import browse_custom_image, load_image_particles
 
 IMAGE_PATTERNS = ('*.png', '*.jpg', '*.jpeg', '*.tif', '*.tiff')
@@ -73,22 +72,13 @@ class SimulationGUI:
         gui.text("--- ACTIVE POTENTIAL ---")
         gui.text(f"Selected: {self.engine.potential_type.upper()}")
         if gui.button("Force: Gravity"):
-            self.engine.potential_type = 'gravity'
-            self.engine.masses[:self.engine.num_active] = 1
-            self.engine.precompute_kernel()
+            self.engine.set_potential('gravity')
         if gui.button("Force: Lennard-Jones"):
-            self.engine.potential_type = 'lennard_jones'
-            self.engine.masses[:self.engine.num_active] = 1
-            self.engine.precompute_kernel()
+            self.engine.set_potential('lennard_jones')
         if gui.button("Force: Mutual Springs"):
-            self.engine.potential_type = 'harmonic'
-            self.engine.masses[:self.engine.num_active] = 1
-            self.engine.precompute_kernel()
+            self.engine.set_potential('harmonic')
         if gui.button("Force: Coulomb"):
-            self.engine.potential_type = 'coulomb'
-            # Randomize charges in Coulomb mode
-            self.engine.masses[:self.engine.num_active] = torch.randint(0, 2, (self.engine.num_active,), device=self.engine.device, dtype=torch.int8) * 2 - 1
-            self.engine.precompute_kernel()
+            self.engine.set_potential('coulomb')  # randomises +/-1 charges
             
         # --- Gas Pressure (PM Mode only) ---
         if self.engine.solver_type == 'pm':
@@ -96,11 +86,11 @@ class SimulationGUI:
             gui.text("--- GAS PRESSURE ---")
             gui.text(f"Selected: {self.engine.pressure_model.upper()}")
             if gui.button("Gas: Cold Dust (None)"):
-                self.engine.pressure_model = 'none'
+                self.engine.set_pressure_model('none')
             if gui.button("Gas: Isothermal (Linear)"):
-                self.engine.pressure_model = 'isothermal'
+                self.engine.set_pressure_model('isothermal')
             if gui.button("Gas: Polytropic (Adiabatic)"):
-                self.engine.pressure_model = 'polytropic'
+                self.engine.set_pressure_model('polytropic')
                 
         # --- Visual Theme Theme ---
         gui.text("")
@@ -137,10 +127,7 @@ class SimulationGUI:
         # Boundary selector
         bound_text = "SOLID WALL BOUNCE" if self.engine.boundary_mode == 'reflective_walls' else "UNIVERSE WRAPPED"
         if gui.button(f"Boundary: {bound_text}"):
-            if self.engine.boundary_mode == 'reflective_walls':
-                self.engine.boundary_mode = 'periodic'
-            else:
-                self.engine.boundary_mode = 'reflective_walls'
+            self.engine.toggle_boundary()
                 
         # Friction (damping)
         self.friction_val = gui.slider_float("Friction (Gas Cooling)", self.friction_val, self.config["sliders"]["friction"][0], self.config["sliders"]["friction"][1])

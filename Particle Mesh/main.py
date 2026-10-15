@@ -20,7 +20,7 @@ _init_taichi = bootstrap.init_taichi
 _init_taichi()
 
 from particle_mesh.render.themes import THEMES
-from particle_mesh.physics.engine import SimulationEngine, NBODY_MAX_PARTICLES
+from particle_mesh.physics.engine import SimulationEngine
 from particle_mesh.render.camera import SimulationCamera
 from particle_mesh.render.circle_renderer import CircleRenderer
 from particle_mesh.render.mesh_renderer import MeshRenderer
@@ -75,16 +75,8 @@ def main():
     arrow_verts = ti.Vector.field(2, dtype=ti.f32, shape=6)
     init_arrow(arrow_verts)
 
-    # Determine safe startup active particle count from configuration
-    initial_particles = SETTINGS.initial_particles
-    if SOLVER_MODE == 'nbody' and initial_particles > NBODY_MAX_PARTICLES:
-        print(f"[Warning] initial_particles ({initial_particles}) is extremely high for O(N^2) Direct N-Body mode.")
-        print(f"          Capping to NBODY_MAX_PARTICLES ({NBODY_MAX_PARTICLES}) to prevent a hang or out-of-memory error.")
-        initial_particles = NBODY_MAX_PARTICLES
-    
-    # Initialize state engine and override solver mode from configuration
-    engine = SimulationEngine(initial_particles=initial_particles)
-    engine.solver_type = SOLVER_MODE
+    # Startup count and solver from the configuration (the engine caps N-body startup counts)
+    engine = SimulationEngine(solver=SOLVER_MODE)
 
     bootstrap.print_status(engine)
     

@@ -37,8 +37,7 @@ def _sync(device):
 
 
 def bench(n, frames, canvas, zoom=1.0, field=False, solver="pm"):
-    eng = E.SimulationEngine(initial_particles=n)
-    eng.solver_type = solver
+    eng = E.SimulationEngine(initial_particles=n, solver=solver)
     eng.precompute_kernel()
     eng.show_field = field
     renderer = MR.MeshRenderer(eng.kernels)

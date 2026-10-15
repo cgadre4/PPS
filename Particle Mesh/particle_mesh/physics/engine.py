@@ -24,6 +24,9 @@ NBODY_MAX_PARTICLES = SETTINGS.nbody_max_particles
 # Slider-driven kernel rebuilds wait until the value has been still this long (seconds)
 KERNEL_REBUILD_DELAY = 0.15
 
+POTENTIALS = ('gravity', 'lennard_jones', 'harmonic', 'coulomb')
+PRESSURE_MODELS = ('none', 'isothermal', 'polytropic')
+
 UNIVERSE_W = SETTINGS.universe_w
 UNIVERSE_H = SETTINGS.universe_h
 GRID_W = PHYSICS_GRID_W
@@ -32,7 +35,11 @@ GRID_H = PHYSICS_GRID_H
 DEVICE = get_torch_device()
 
 class SimulationEngine:
-    def __init__(self, initial_particles=None):
+    def __init__(self, initial_particles=None, solver=None):
+        """
+        initial_particles: startup count (default: config initial_particles). solver: 'pm' or 'nbody' (default:
+        config SOLVER). In N-body mode the startup count is capped at NBODY_MAX_PARTICLES.
+        """
         self.device = DEVICE
         self.width = WIDTH
         self.height = HEIGHT
@@ -40,7 +47,7 @@ class SimulationEngine:
         self.universe_h = UNIVERSE_H
         
         # Solver & Mode Settings
-        self.solver_type = SETTINGS.solver
+        self.solver_type = (solver or SETTINGS.solver).lower()
         self.potential_type = 'gravity' # 'gravity', 'lennard_jones', 'harmonic'
         self.pressure_model = 'none' # 'none', 'isothermal', 'polytropic'
         self.boundary_mode = 'periodic' # 'periodic' (wrap around, matches the FFT solver), 'reflective_walls'
@@ -81,6 +88,10 @@ class SimulationEngine:
         # Particle State Tensors
         if initial_particles is None:
             initial_particles = SETTINGS.initial_particles
+        if self.solver_type == 'nbody' and initial_particles > NBODY_MAX_PARTICLES:
+            print(f"[Warning] initial_particles ({initial_particles}) is extremely high for O(N^2) Direct N-Body mode.")
+            print(f"          Capping to NBODY_MAX_PARTICLES ({NBODY_MAX_PARTICLES}) to prevent a hang or out-of-memory error.")
+            initial_particles = NBODY_MAX_PARTICLES
         self.num_active = initial_particles
         self.pos = torch.zeros((MAX_PARTICLES, 2), device=self.device)
         self.vel = torch.zeros((MAX_PARTICLES, 2), device=self.device)
@@ -176,6 +187,26 @@ class SimulationEngine:
         self._kernel_dirty_since = None
         self._field_dirty = True
         self.pm_solver.update_kernel(self.potential_type, self._physics_params())
+
+    # ------------------------------------------------------------------ commands (called by the GUI panel)
+
+    def set_potential(self, kind):
+        """Switch the interaction potential. Resets every particle's mass/charge (random +/-1 charges for Coulomb,
+        1 otherwise) and rebuilds the kernel immediately."""
+        if kind not in POTENTIALS:
+            raise ValueError(f"Unknown potential: {kind}")
+        self.potential_type = kind
+        self.masses[:self.num_active] = self._new_masses(self.num_active)
+        self.precompute_kernel()
+
+    def set_pressure_model(self, model):
+        if model not in PRESSURE_MODELS:
+            raise ValueError(f"Unknown pressure model: {model}")
+        self.pressure_model = model
+
+    def toggle_boundary(self):
+        """Switch between the periodic (wrapped) universe and reflective walls."""
+        self.boundary_mode = 'periodic' if self.boundary_mode == 'reflective_walls' else 'reflective_walls'
 
     def capacity(self):
         """
