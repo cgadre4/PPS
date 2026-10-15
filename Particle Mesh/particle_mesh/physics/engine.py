@@ -7,6 +7,7 @@ from particle_mesh.physics.nbody_solver import DirectNBodySolver
 from particle_mesh.physics.pm_solver import ParticleMeshSolver
 from particle_mesh.kernels import make_backend
 from particle_mesh.runtime.device import const_tensor, get_torch_device
+from particle_mesh.view_state import VIEW_FIELDS, ViewState
 
 WIDTH = SETTINGS.width
 HEIGHT = SETTINGS.height
@@ -33,6 +34,10 @@ GRID_W = PHYSICS_GRID_W
 GRID_H = PHYSICS_GRID_H
 
 DEVICE = get_torch_device()
+
+def _forward_to_view(name):
+    return property(lambda self: getattr(self.view, name), lambda self, value: setattr(self.view, name, value))
+
 
 class SimulationEngine:
     def __init__(self, initial_particles=None, solver=None):
@@ -70,20 +75,8 @@ class SimulationEngine:
         
         self.uniform_spawn = False
         
-        # Rendering & Visualization States
-        self.show_fft = SETTINGS.show_fft
-        self.use_bandpass_render = False
-        self.show_potential = False
-        self.show_field = False
-        
-        self.pot_min_log = SETTINGS.slider("potential_min_log")[2]
-        self.pot_max_log = SETTINGS.slider("potential_max_log")[2]
-        self.field_min_log = SETTINGS.slider("field_min_log")[2]
-        self.field_max_log = SETTINGS.slider("field_max_log")[2]
-        
-        self.bp_inner = SETTINGS.slider("bp_inner")[2]
-        self.bp_outer = SETTINGS.slider("bp_outer")[2]
-        self.bp_transition = SETTINGS.slider("bp_transition")[2]
+        # Rendering & Visualization States (view toggles, colour ranges, band-pass, theme)
+        self.view = ViewState.from_settings()
         
         # Particle State Tensors
         if initial_particles is None:
@@ -433,3 +426,8 @@ class SimulationEngine:
         # Apply fluid dampening cooling (if Lennard-Jones active in N-body mode)
         if self.potential_type == 'lennard_jones' and self.solver_type == 'nbody':
             self.vel[:n] *= 0.99
+
+
+# View toggles, colour ranges, band-pass and theme live in engine.view (a ViewState); engine.<name> forwards to it
+for _name in VIEW_FIELDS:
+    setattr(SimulationEngine, _name, _forward_to_view(_name))

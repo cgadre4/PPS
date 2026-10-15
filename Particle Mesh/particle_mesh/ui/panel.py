@@ -6,8 +6,9 @@ IMAGE_PATTERNS = ('*.png', '*.jpg', '*.jpeg', '*.tif', '*.tiff')
 
 
 class SimulationGUI:
-    def __init__(self, engine, camera, config):
+    def __init__(self, engine, camera, config, palettes):
         self.engine = engine
+        self.palettes = palettes  # colour themes (render.colormap.Palettes)
         self.camera = camera
         self.config = config
 
@@ -95,9 +96,9 @@ class SimulationGUI:
         # --- Visual Theme Theme ---
         gui.text("")
         gui.text("--- VISUALS ---")
-        gui.text(f"Theme: {self.engine.theme_names[self.engine.color_theme]}")
+        gui.text(f"Theme: {self.palettes.names[self.engine.color_theme]}")
         if gui.button("Next Color Theme"):
-            self.engine.color_theme = (self.engine.color_theme + 1) % len(self.engine.theme_names)
+            self.engine.color_theme = self.palettes.cycle(self.engine.color_theme)
             
         # --- Advanced View Settings (PM Mode only) ---
         if self.engine.solver_type == 'pm':

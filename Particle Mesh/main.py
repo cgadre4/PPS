@@ -20,6 +20,7 @@ _init_taichi = bootstrap.init_taichi
 _init_taichi()
 
 from particle_mesh.render.themes import THEMES
+from particle_mesh.render.colormap import Palettes
 from particle_mesh.physics.engine import SimulationEngine
 from particle_mesh.render.camera import SimulationCamera
 from particle_mesh.render.circle_renderer import CircleRenderer
@@ -83,19 +84,14 @@ def main():
     # Pre-calculate active potentials
     engine.precompute_kernel()
     
-    # Setup themes directly on engine
-    engine.color_theme = 0
-    engine.theme_names = list(THEMES.keys())
-    engine.color_maps = [
-        torch.tensor(THEMES[name], dtype=torch.float32, device=engine.device) 
-        for name in engine.theme_names
-    ]
+    # Colour themes on the sim device; the active index is engine.color_theme (engine.view)
+    palettes = Palettes(THEMES, engine.device)
 
     # Initialize Camera, Renderers and GUI controllers
     camera = SimulationCamera(WIDTH, HEIGHT, engine.universe_w, engine.universe_h)
     circle_renderer = CircleRenderer()
     mesh_renderer = MeshRenderer(engine.kernels)
-    sim_gui = SimulationGUI(engine, camera, CONFIG)
+    sim_gui = SimulationGUI(engine, camera, CONFIG, palettes)
 
     # N-body Coulomb circle colours (created once, not every frame)
     positive_color = torch.tensor([255.0, 50.0, 50.0], device=engine.device)
@@ -146,9 +142,9 @@ def main():
 
         # Keyboard Toggles (Edge-Triggered)
         if keys.pressed(ti.ui.RIGHT):
-            engine.color_theme = (engine.color_theme + 1) % len(engine.theme_names)
+            engine.color_theme = palettes.cycle(engine.color_theme, 1)
         if keys.pressed(ti.ui.LEFT):
-            engine.color_theme = (engine.color_theme - 1) % len(engine.theme_names)
+            engine.color_theme = palettes.cycle(engine.color_theme, -1)
         if keys.pressed('p') and engine.solver_type == 'pm':
             engine.show_potential = not engine.show_potential
         if keys.pressed('f') and engine.solver_type == 'pm':
@@ -238,7 +234,7 @@ def main():
         canvas.set_background_color((0.02, 0.02, 0.03))
 
         # Render frame
-        active_map = engine.color_maps[engine.color_theme]
+        active_map = palettes.get(engine.color_theme)
         
         if engine.num_active > 0:
             if engine.solver_type == 'nbody':
