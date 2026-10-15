@@ -33,7 +33,8 @@ def _run(backend, device, periodic):
     backend.gather_integrate(stencil, pos, vel, m, N, fx.to(device), fy.to(device), CS, 0.37, 0.9, True,
                              periodic, UW, UH)
     view = backend.splat_view(pos, N, 3.0, -2.0, 1.7, 80, 60, 2.0)
-    return dens.cpu(), pos.cpu(), vel.cpu(), view.cpu(), mass
+    assert view.shape == (80, 60)                               # (view_w, view_h), x-major
+    return dens.cpu(), pos.cpu(), vel.cpu(), view.cpu().long(), mass
 
 
 @pytest.mark.parametrize("periodic", [True, False], ids=["periodic", "clamped"])

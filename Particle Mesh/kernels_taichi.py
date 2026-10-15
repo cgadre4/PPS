@@ -96,4 +96,5 @@ def splat_view_kernel(
         gx = ti.floor((pos[p, 0] - cam_x) * scale)
         gy = ti.floor((pos[p, 1] - cam_y) * scale)
         if 0 <= gx < view_w and 0 <= gy < view_h:
-            ti.atomic_add(out[ti.cast(gy, ti.i32), ti.cast(gx, ti.i32)], 1.0)
+            # out is (view_w, view_h) int32, x-major (GGUI [x, y] layout), like kernels_torch.splat_view
+            ti.atomic_add(out[ti.cast(gx, ti.i32), ti.cast(gy, ti.i32)], 1)

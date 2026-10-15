@@ -9,6 +9,18 @@ Grid layout: physics grids are (H, W) row-major, indexed [j, i]; flat index = j 
 """
 import torch
 
+_CONSTS = {}
+
+
+def _const(values, device, dtype):
+    """Small constant tensor, created once per (values, device, dtype). Creating it per call costs a host->device
+    copy and an implicit queue sync on every step (AUDIT §8 F07)."""
+    key = (values, str(device), dtype)
+    t = _CONSTS.get(key)
+    if t is None:
+        t = _CONSTS[key] = torch.tensor(values, device=device, dtype=dtype)
+    return t
+
 
 class CICStencil:
     """Cloud-in-cell corner indices (4, N) and weights (4, N) for one set of positions.
@@ -31,7 +43,7 @@ def cic_stencil(pos, num_active, cell_size, grid_w, grid_h, periodic):
     w0 = 1.0 - w1
     c0 = f.to(torch.int64)
     if periodic:
-        dims = torch.tensor([grid_w, grid_h], device=pos.device, dtype=torch.int64)
+        dims = _const((grid_w, grid_h), pos.device, torch.int64)
         c0.remainder_(dims)
         c1 = c0 + 1
         c1 = torch.where(c1 == dims, 0, c1)
@@ -75,19 +87,23 @@ def gather_integrate(stencil, pos, vel, mass, num_active, force_x, force_y, dt, 
 
 
 def wrap_positions(pos, num_active, universe_w, universe_h):
-    p = pos[:num_active]
-    size = torch.tensor([universe_w, universe_h], device=pos.device, dtype=pos.dtype)
-    p.copy_(torch.remainder(p, size))
+    """Wrap positions into [0, universe) in place (no temporary copy)."""
+    pos[:num_active].remainder_(_const((float(universe_w), float(universe_h)), pos.device, pos.dtype))
 
 
 def splat_view(pos, num_active, cam_x, cam_y, zoom, view_w, view_h, render_cell_size):
-    """Count particles per viewport render cell. Returns a float (view_h, view_w) tensor."""
+    """
+    Count particles per viewport render cell. Returns integer counts, shape (view_w, view_h): x-major, i.e. GGUI's
+    [x, y] image layout, so the renderer needs no transpose.
+
+    Cell indices are shifted by one and clamped into a one-cell border ring around the view; off-screen particles
+    land on the ring, which is dropped. That needs no bool masks or torch.where, and spreads off-screen hits over
+    the ring's ~2*(W+H) cells instead of one hot bin.
+    """
     p = pos[:num_active]
     scale = zoom / render_cell_size
-    gx = torch.floor((p[:, 0] - cam_x) * scale)
-    gy = torch.floor((p[:, 1] - cam_y) * scale)
-    inside = (gx >= 0) & (gx < view_w) & (gy >= 0) & (gy < view_h)
-    # Off-screen particles go to one extra trailing bin that is dropped (no compaction, no host sync)
-    flat = torch.where(inside, gy * view_w + gx, float(view_w * view_h)).to(torch.int64)
-    counts = torch.bincount(flat, minlength=view_w * view_h + 1)
-    return counts[:view_w * view_h].view(view_h, view_w).to(torch.float32)
+    gx = (p[:, 0] - cam_x).mul_(scale).floor_().add_(1.0).clamp_(0.0, view_w + 1.0)
+    gy = (p[:, 1] - cam_y).mul_(scale).floor_().add_(1.0).clamp_(0.0, view_h + 1.0)
+    flat = gx.mul_(view_h + 2).add_(gy).to(torch.int64)        # exact in float32 below 2^24 cells
+    counts = torch.bincount(flat, minlength=(view_w + 2) * (view_h + 2))
+    return counts.view(view_w + 2, view_h + 2)[1:-1, 1:-1]
