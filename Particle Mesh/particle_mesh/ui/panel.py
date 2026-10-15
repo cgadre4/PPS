@@ -5,33 +5,43 @@ from particle_mesh.ui.image_loader import browse_custom_image, load_image_partic
 IMAGE_PATTERNS = ('*.png', '*.jpg', '*.jpeg', '*.tif', '*.tiff')
 
 
+def scan_images():
+    """Spawnable images in the working folder."""
+    files = []
+    for pattern in IMAGE_PATTERNS:
+        files.extend(glob.glob(pattern))
+    return sorted(set(files))
+
+
 class SimulationGUI:
-    def __init__(self, engine, camera, config, palettes):
+    def __init__(self, engine, camera, config, palettes, controls, browse=browse_custom_image,
+                 load=load_image_particles, scan=scan_images):
+        """
+        The ImGui control panel. It calls engine commands, writes engine parameters and the shared Controls
+        (brush, spawn and time-scale values) in place. browse / load / scan are the image picker, image loader and
+        folder scan (injectable for tests).
+        """
         self.engine = engine
         self.palettes = palettes  # colour themes (render.colormap.Palettes)
+        self.controls = controls  # ui.state.Controls
         self.camera = camera
         self.config = config
+        self._browse = browse
+        self._load = load
+        self._scan = scan
 
         # UI sizing configurations
         self.ui_w = config["display"].get("ui_width", 0.15)  # Panel width fraction
 
         # State variables for log sliders
         self.log_G_val = math.log10(self.engine.G)
-        self.log_time_val = config["sliders"]["time_scale_log"][2]
         self.friction_val = self.engine.friction
         self.softening_val = self.engine.softening_length
 
         # Image spawner variables. The folder is scanned once (and on "Rescan"), not every frame.
         self.custom_image_path = None
         self.custom_image_name = None
-        self.image_files = self._scan_images()
-
-    @staticmethod
-    def _scan_images():
-        files = []
-        for pattern in IMAGE_PATTERNS:
-            files.extend(glob.glob(pattern))
-        return sorted(set(files))
+        self.image_files = self._scan()
 
     def _range(self, name, fallback):
         """[min, max] of a slider from config.json (fallback when the entry is missing)."""
@@ -40,7 +50,7 @@ class SimulationGUI:
 
     def _spawn_image(self, path, spawn_density):
         rcs = self.config["simulation"]["RENDER_CELL_SIZE"]
-        np_coords = load_image_particles(
+        np_coords = self._load(
             path,
             self.camera.cam_x, self.camera.cam_y, self.camera.zoom,
             spawn_density, self.camera.width, self.camera.height,
@@ -50,12 +60,9 @@ class SimulationGUI:
         if np_coords is not None:
             self.engine.load_particles_from_array(np_coords)
 
-    def render(self, gui, fps_display, interaction_radius, spawn_vel, spawn_density):
-        """
-        Renders the IMGUI panels on the window canvas.
-        Returns:
-            updated values for: interaction_radius, spawn_vel, spawn_density
-        """
+    def render(self, gui, fps_display):
+        """Renders the ImGui panel. Brush, spawn and time-scale sliders write self.controls in place."""
+        controls = self.controls
         # Define layout height depending on FFT minimap presence
         # Minimap takes some height at the bottom left
         minimap_h_px = int(self.camera.width * self.ui_w)
@@ -140,7 +147,7 @@ class SimulationGUI:
         self.engine.softening_length = self.softening_val
         
         # Time Scale Log
-        self.log_time_val = gui.slider_float("Time Scale (Log)", self.log_time_val, self.config["sliders"]["time_scale_log"][0], self.config["sliders"]["time_scale_log"][1])
+        controls.log_time = gui.slider_float("Time Scale (Log)", controls.log_time, self.config["sliders"]["time_scale_log"][0], self.config["sliders"]["time_scale_log"][1])
         
         # --- Potential Coefficients ---
         gui.text("")
@@ -178,11 +185,11 @@ class SimulationGUI:
         # --- Spawner Brush ---
         gui.text("")
         gui.text("--- SPAWNER BRUSH ---")
-        interaction_radius = gui.slider_float("Brush Radius", interaction_radius, self.config["sliders"]["brush_radius"][0], self.config["sliders"]["brush_radius"][1])
+        controls.radius = gui.slider_float("Brush Radius", controls.radius, self.config["sliders"]["brush_radius"][0], self.config["sliders"]["brush_radius"][1])
         # Gravity: multiple of the circular orbit speed (1 = equilibrium disk, negative = counter-rotating).
         # Other potentials: thermal speed multiplier.
-        spawn_vel = gui.slider_float("Spawn Velocity (x orbit)", spawn_vel, self.config["sliders"]["spawn_velocity"][0], self.config["sliders"]["spawn_velocity"][1])
-        spawn_density = gui.slider_float("Density (stars/px^2)", spawn_density, self.config["sliders"]["spawn_density"][0], self.config["sliders"]["spawn_density"][1])
+        controls.spawn_vel = gui.slider_float("Spawn Velocity (x orbit)", controls.spawn_vel, self.config["sliders"]["spawn_velocity"][0], self.config["sliders"]["spawn_velocity"][1])
+        controls.spawn_density = gui.slider_float("Density (stars/px^2)", controls.spawn_density, self.config["sliders"]["spawn_density"][0], self.config["sliders"]["spawn_density"][1])
         
         spawn_type_text = "Uniform Disk" if self.engine.uniform_spawn else "Dense Core"
         gui.text(f"Spawn Mode: {spawn_type_text}")
@@ -193,21 +200,21 @@ class SimulationGUI:
         gui.text("")
         gui.text("--- LOAD ASTRO-IMAGE ---")
         if gui.button("Browse Image (Explorer)..."):
-            path, name = browse_custom_image()
+            path, name = self._browse()
             if path:
                 self.custom_image_path = path
                 self.custom_image_name = name
                 
         if self.custom_image_path and self.custom_image_name:
             if gui.button(f"Spawn {self.custom_image_name}"):
-                self._spawn_image(self.custom_image_path, spawn_density)
+                self._spawn_image(self.custom_image_path, controls.spawn_density)
 
         # Images in the working folder (scanned at startup; rescan on demand)
         if gui.button("Rescan Images"):
-            self.image_files = self._scan_images()
+            self.image_files = self._scan()
         for img_name in self.image_files:
             if img_name != self.custom_image_name and gui.button(f"Spawn {img_name}"):
-                self._spawn_image(img_name, spawn_density)
+                self._spawn_image(img_name, controls.spawn_density)
 
         # --- Bandpass & FFT Minimap (PM Mode only) ---
         if self.engine.solver_type == 'pm':
@@ -247,5 +254,3 @@ class SimulationGUI:
             self.camera.reset()
             
         gui.end()
-        
-        return interaction_radius, spawn_vel, spawn_density
