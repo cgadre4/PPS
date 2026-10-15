@@ -14,3 +14,8 @@ dependencies = [
 
 [tool.uv]
 extra-index-url = ["https://download.pytorch.org/whl/xpu"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
