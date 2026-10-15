@@ -23,7 +23,7 @@ Severity: **High** = wrong results, crash, or a feature that silently does nothi
 | 7 | Medium | The k=0 (mean) mode of the potential isn't zeroed. That adds a huge constant to φ, which wrecks float32 precision at large force range and washes out the potential view. | `potentials.py:39-47,79-88` |
 | 8 | Medium | Forces are periodic (FFT) but particles are deleted at the edges, not wrapped. Mass near one edge pulls particles at the opposite edge. The GUI calls this mode "UNIVERSE WRAPPED". | `engine.py:198-206`, `gui.py:113` |
 | 9 | Medium | Pressure is applied as acceleration `-P∇ρ^γ` rather than `-∇P/ρ`, so it explodes in dense regions. | `potentials.py:106-115` |
-| 10 | Medium | Potential, field and bandpass views are wrong whenever `RENDER_CELL_SIZE ≠ 1` (the local `config.json` uses 2). | `main.py:283-296,380-381` |
+| 10 | Medium | ~~Potential, field and bandpass views are wrong whenever `RENDER_CELL_SIZE ≠ 1` (the local `config.json` uses 2).~~ Fixed. | `main.py:283-296,380-381` |
 | 11 | Medium | Particle data is read 3–4 times per frame plus a GPU sync. At 100M particles that is about 6–7 GB of memory traffic per frame. | `engine.py:199-206`, `pm_solver.py`, `mesh_renderer.py:37-46` |
 | 12 | Medium | About 1 GB of redundant precomputed grids, and the kernel is stored as full complex when only half is used. | `potentials.py:12-25`, `pm_solver.py:69-74` |
 | 13 | High (XPU) | The August Arc port passes XPU tensors into Taichi Vulkan kernels. Taichi copies every argument to the CPU and back on every call. **Verified, measured.** | `C:\Python Dev\PPS\Particle Mesh\pm_solver.py` |
@@ -101,6 +101,8 @@ The raw CIC density is also noisy (shot noise), and its gradient is noisier stil
 **Fix:** divide by `max(ρ, ε)` and smooth the density first. A Gaussian filter in k-space is free here, because `rho_k` is already computed.
 
 ### 2.10 Advanced views break when `RENDER_CELL_SIZE ≠ 1` (Medium)
+**Fixed** on branch `fix/render-cell-size-views`: `main.build_view_grid()` scales by `RENDER_CELL_SIZE` and samples at render-cell centres. The minimap sizing part was fixed in PR #1.
+
 `main.py:291-292` computes `world = screen_x / zoom + cam_x` with `screen_x` in render cells, not pixels. With `RENDER_CELL_SIZE = 2` (the setting in `C:\Python Dev\PPS\Particle Mesh\config.json`), the potential, bandpass and field views show the wrong quarter of the screen at 2× scale.
 
 The minimap size (`main.py:380-381`) is also in pixels but is written into a render-cell-sized buffer.
