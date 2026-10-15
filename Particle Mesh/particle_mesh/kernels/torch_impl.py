@@ -18,18 +18,9 @@ Grid layout: physics grids are (H, W) row-major, indexed [j, i]; flat index = j 
 """
 import torch
 
-_CONSTS = {}
+from particle_mesh.runtime.device import const_tensor as _const
+
 _BUFFERS = {}
-
-
-def _const(values, device, dtype):
-    """Small constant tensor, created once per (values, device, dtype). Creating it per call costs a host->device
-    copy and an implicit queue sync on every step (AUDIT §8 F07)."""
-    key = (values, str(device), dtype)
-    t = _CONSTS.get(key)
-    if t is None:
-        t = _CONSTS[key] = torch.tensor(values, device=device, dtype=dtype)
-    return t
 
 
 def _buffer(name, shape, device, dtype=torch.float32):

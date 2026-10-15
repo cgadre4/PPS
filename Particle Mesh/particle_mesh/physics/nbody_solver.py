@@ -1,7 +1,6 @@
 import torch
 
-import kernels_taichi as KTI
-from kernels import taichi_shares_memory
+from particle_mesh.kernels import nbody_accel
 
 # Elements per (tile_rows x N) pairwise tensor. Memory is O(N * tile) instead of O(N^2) (AUDIT 3.5).
 TILE_ELEMENTS = 1 << 22
@@ -30,26 +29,15 @@ class DirectNBodySolver:
         return self._solve_torch(pos, masses, potential_type, params, periodic, universe_w, universe_h)
 
     def _solve_taichi(self, pos, masses, potential_type, params, periodic, universe_w, universe_h):
-        """
-        One fused Taichi kernel: one thread per target, no N x N temporaries. Zero-copy where Taichi shares memory
-        with torch (CUDA, CPU). Otherwise (torch XPU + Taichi Vulkan) it hops through small CPU tensors. N-body
-        particle counts are small (8 bytes of position per particle), so that hop is cheap, unlike the PM grids.
-        """
+        """One fused Taichi kernel (one thread per target, no N x N temporaries), launched via kernels.nbody_accel."""
         N = len(pos)
-        shared = taichi_shares_memory(pos.device)
-        p = pos.contiguous() if shared else pos.to('cpu').contiguous()
-        m = masses.contiguous() if shared else masses.to('cpu').contiguous()
-        acc = torch.empty((N, 2), dtype=torch.float32, device=p.device)
-        KTI.nbody_accel_kernel(
-            p, m, acc, N, _KINDS[potential_type],
+        return nbody_accel(
+            pos, masses, _KINDS[potential_type],
             float(params.get('G', 1.0)), float(params.get('spring_k', 0.1)) / N,
             float(params.get('epsilon', 1000.0)), float(params.get('sigma', 40.0)),
             float(params.get('softening_length', 1.5)) ** 2, 1.0 / float(params.get('force_range', 8192.0)),
             int(bool(periodic)), float(universe_w or 1.0), float(universe_h or 1.0)
         )
-        if not shared:
-            acc = acc.to(pos.device)
-        return acc[:, 0], acc[:, 1]
 
     def _solve_torch(self, pos, masses, potential_type, params, periodic, universe_w, universe_h):
         """

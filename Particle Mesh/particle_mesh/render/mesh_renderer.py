@@ -1,111 +1,45 @@
 import math
-import numpy as np
 import taichi as ti
 import torch
-from taichi.ui.utils import get_field_info
 
-from config import CONFIG
-from kernels import to_taichi
+from particle_mesh.settings import SETTINGS
+from particle_mesh.runtime.device import to_taichi
+from particle_mesh.render.ggui_present import HostFramePresenter
 
-WIDTH = CONFIG["display"]["WIDTH"]
-HEIGHT = CONFIG["display"]["HEIGHT"]
-RENDER_CELL_SIZE = CONFIG["simulation"]["RENDER_CELL_SIZE"]
+WIDTH = SETTINGS.width
+HEIGHT = SETTINGS.height
+RENDER_CELL_SIZE = SETTINGS.render_cell_size
 
-VIEW_W = int(WIDTH / RENDER_CELL_SIZE)
-VIEW_H = int(HEIGHT / RENDER_CELL_SIZE)
+VIEW_W = SETTINGS.view_w
+VIEW_H = SETTINGS.view_h
 
 # --- Vector arrow grid (spacing in render cells) ---
-PIXELS_PER_ARROW = CONFIG["display"].get("pixels_per_arrow", 32)
+PIXELS_PER_ARROW = SETTINGS.pixels_per_arrow
 NUM_ARROWS_X = VIEW_W // PIXELS_PER_ARROW
 NUM_ARROWS_Y = VIEW_H // PIXELS_PER_ARROW
 TOTAL_ARROWS = NUM_ARROWS_X * NUM_ARROWS_Y
 
 # FFT minimap: recompute the thumbnail every N frames (the spectrum changes slowly; it is ~0.5-1 ms per refresh)
-MINIMAP_INTERVAL = max(1, int(CONFIG["display"].get("minimap_interval", 4)))
+MINIMAP_INTERVAL = SETTINGS.minimap_interval
 # Largest count-indexed colour LUT (entries); beyond this the float colour path is used
 MAX_COUNT_LUT = 1 << 20
-# Opaque alpha in the packed RGBA8 word (little-endian bytes R, G, B, A), as a signed int32
-ALPHA = -(1 << 24)  # 0xFF000000
+from particle_mesh.render.colormap import (  # noqa: E402,F401  (re-exported)
+    ALPHA, _LUT_CACHE, _color_lut, _gradient, _log_norm, _pack_gray, _pack_rgb, colorize,
+)
 
 
-def _gradient(norm, color_map):
-    """Interpolate the 9-stop theme gradient. norm in [0, 1], any shape -> (..., 3) float 0-255."""
-    idx_f = norm * 8.0
-    lower = torch.floor(idx_f).to(torch.int64).clamp_(0, 8)
-    upper = (lower + 1).clamp_(max=8)
-    weight = (idx_f - lower.to(idx_f.dtype)).unsqueeze(-1)
-    return color_map[lower] * (1.0 - weight) + color_map[upper] * weight
-
-
-def _log_norm(values, min_log, max_log):
-    log_v = torch.log10(values + 0.1)
-    return ((log_v - min_log) / max(max_log - min_log, 1e-6)).clamp_(0.0, 1.0)
-
-
-def _pack_rgb(rgb):
-    """(..., 3) float/uint8 0-255 -> (...) int32 packed RGBA8 (R in the low byte, alpha 255)."""
-    rgb = rgb.to(torch.int32)
-    return rgb[..., 0] | (rgb[..., 1] << 8) | (rgb[..., 2] << 16) | ALPHA
-
-
-def _pack_gray(gray):
-    """uint8 gray -> packed RGBA8 int32."""
-    return gray.to(torch.int32) * 0x010101 | ALPHA
-
-
-_LUT_CACHE = {}
-
-def _color_lut(color_map):
-    """257-entry packed-RGBA8 table for a theme: 256 gradient steps plus opaque black for empty cells."""
-    key = (color_map.data_ptr(), str(color_map.device))
-    lut = _LUT_CACHE.get(key)
-    if lut is None:
-        steps = _gradient(torch.linspace(0.0, 1.0, 256, device=color_map.device), color_map)
-        rgb = torch.cat((steps, torch.zeros((1, 3), device=color_map.device))).to(torch.uint8)
-        lut = _pack_rgb(rgb)
-        _LUT_CACHE[key] = lut
-    return lut
-
-
-def colorize(values, color_map, min_log, max_log, scale):
-    """Float image (any 2D layout) -> packed RGBA8 int32 of the same shape via log10; zero/empty -> black."""
-    idx = (_log_norm(values * scale, min_log, max_log) * 255.0).round_().to(torch.int64)
-    idx = torch.where(values > 0, idx, 256)
-    return _color_lut(color_map)[idx]
-
-
-def build_view_grid(camera, universe_w, universe_h, device):
-    """
-    grid_sample coordinates that map every viewport render cell onto the physics grid.
-    Returns a (1, VIEW_H, VIEW_W, 2) tensor of normalised [-1, 1] coordinates (for align_corners=False).
-    """
-    grid_w = int(camera.width / RENDER_CELL_SIZE)
-    grid_h = int(camera.height / RENDER_CELL_SIZE)
-
-    screen_y, screen_x = torch.meshgrid(
-        torch.arange(grid_h, device=device, dtype=torch.float32),
-        torch.arange(grid_w, device=device, dtype=torch.float32),
-        indexing='ij'
-    )
-    # Render cell (gx, gy) covers screen pixels [gx, gx + 1) * RENDER_CELL_SIZE (same binning as splat_view);
-    # sample the physics grid at the world position of that cell's centre.
-    world_gx = (screen_x + 0.5) * RENDER_CELL_SIZE / camera.zoom + camera.cam_x
-    world_gy = (screen_y + 0.5) * RENDER_CELL_SIZE / camera.zoom + camera.cam_y
-
-    grid_x_norm = (world_gx / universe_w) * 2.0 - 1.0
-    grid_y_norm = (world_gy / universe_h) * 2.0 - 1.0
-    return torch.stack((grid_x_norm, grid_y_norm), dim=-1).unsqueeze(0)
-
-
-def _sample(grid, view_grid):
-    """grid_sample one (H, W) physics grid onto the viewport -> (VIEW_H, VIEW_W)."""
-    return torch.nn.functional.grid_sample(grid[None, None], view_grid, align_corners=False,
-                                           padding_mode='zeros')[0, 0]
+from particle_mesh.render.viewport import _sample, build_view_grid  # noqa: E402,F401  (re-exported)
 
 
 class MeshRenderer:
-    def __init__(self, kernels):
+    def __init__(self, kernels, settings=SETTINGS):
         self.kernels = kernels  # particle backend; provides splat_view on the sim device
+        # Render settings, captured once (no per-frame config reads)
+        self.min_log_density = settings.min_log_density
+        self.max_log_density = settings.max_log_density
+        self.zoom_intensity_scale = settings.zoom_intensity_scale
+        self.arrow_style = (settings.arrow_length_scale, settings.arrow_head_size, settings.arrow_head_angle,
+                            settings.arrow_width)
         self._bandpass = None
         self._bandpass_key = None
         self._count_lut = None
@@ -115,14 +49,10 @@ class MeshRenderer:
         self._thumb = None
         self._thumb_key = None
         self._frame = 0
-        # Presentation buffer: the finished frame as packed RGBA8 uint32 in GGUI's [x, y] layout, handed to GGUI
-        # as a host pointer (see _present). Pinned when the torch accelerator supports it (faster readback).
-        try:
-            self._host = torch.empty((VIEW_W, VIEW_H), dtype=torch.int32, pin_memory=True)
-        except RuntimeError:
-            self._host = torch.empty((VIEW_W, VIEW_H), dtype=torch.int32)
-        self._host_np = self._host.numpy().view(np.uint32)
-        self._host_info = get_field_info(self._host_np)
+        # Presentation: the finished frame goes to GGUI through one persistent (pinned) host buffer
+        self._presenter = HostFramePresenter(VIEW_W, VIEW_H)
+        self._host = self._presenter.host
+        self._host_np = self._presenter.host_np
         # Arrow vertex buffers (Taichi fields; created here, after ti.init, never at import)
         self.vector_verts = self.vector_colors = None
         if TOTAL_ARROWS > 0:
@@ -208,49 +138,46 @@ class MeshRenderer:
 
     # ------------------------------------------------------------------ frames
 
-    def render_pm(self, canvas, engine, camera, color_map, ui_w):
+    def render_pm(self, canvas, engine, camera, color_map, ui_w, view=None):
         """
         Draws a full PM-mode frame: the particle density (or the potential / band-passed density view), the
-        optional FFT minimap overlay and the optional force-arrow overlay.
+        optional FFT minimap overlay and the optional force-arrow overlay. view: a ViewState (default engine.view).
         """
+        view = engine.view if view is None else view
         self._frame += 1
         solver = engine.pm_solver
-        sim_cfg = CONFIG["simulation"]
         rho_k = solver.rho_k  # density spectrum from this step's solve (no extra FFT)
         mask = None
-        if rho_k is not None and (engine.show_fft or engine.use_bandpass_render):
-            mask = self.bandpass_mask(solver.k_sq, engine.bp_inner, engine.bp_outer, engine.bp_transition)
+        if rho_k is not None and (view.show_fft or view.use_bandpass_render):
+            mask = self.bandpass_mask(solver.k_sq, view.bp_inner, view.bp_outer, view.bp_transition)
 
         # FFT radar thumbnail, pasted into the frame before it is presented. It spans ui_w of the window width,
         # measured in render cells.
         overlay = None
-        if engine.show_fft and rho_k is not None:
+        if view.show_fft and rho_k is not None:
             overlay = self._minimap(rho_k, mask, int(camera.width * ui_w / RENDER_CELL_SIZE))
 
-        if engine.show_potential:
-            view = _sample(solver.phi, self._view_grid_for(camera, engine)).abs_()
-            self.render_grid(canvas, view, color_map, engine.pot_min_log, engine.pot_max_log, 1.0, overlay=overlay)
-        elif engine.use_bandpass_render and rho_k is not None:
+        if view.show_potential:
+            image = _sample(solver.phi, self._view_grid_for(camera, engine)).abs_()
+            self.render_grid(canvas, image, color_map, view.pot_min_log, view.pot_max_log, 1.0, overlay=overlay)
+        elif view.use_bandpass_render and rho_k is not None:
             # Identity band-pass: the filtered density is just the density grid (no inverse FFT)
             if mask is None:
                 filtered = solver.density_grid
             else:
                 filtered = torch.fft.irfft2(rho_k * mask, s=solver.density_grid.shape)
-            view = _sample(filtered, self._view_grid_for(camera, engine)).clamp_(min=0.0)
-            self.render_grid(canvas, view, color_map, sim_cfg["MIN_LOG_DENSITY"], sim_cfg["MAX_LOG_DENSITY"], 1.0,
+            image = _sample(filtered, self._view_grid_for(camera, engine)).clamp_(min=0.0)
+            self.render_grid(canvas, image, color_map, self.min_log_density, self.max_log_density, 1.0,
                              overlay=overlay)
         else:
             self.render(canvas, engine.pos, engine.num_active, camera.cam_x, camera.cam_y, camera.zoom, color_map,
-                        sim_cfg["MIN_LOG_DENSITY"], sim_cfg["MAX_LOG_DENSITY"], sim_cfg["ZOOM_INTENSITY_SCALE"],
+                        self.min_log_density, self.max_log_density, self.zoom_intensity_scale,
                         overlay=overlay)
 
-        if engine.show_field:
-            disp = CONFIG["display"]
+        if view.show_field:
             self.render_vectors(
                 canvas, solver.fx, solver.fy, camera, engine.universe_w, engine.universe_h, color_map,
-                engine.field_min_log, engine.field_max_log,
-                disp.get("arrow_length_scale", 1.5), disp.get("arrow_head_size", 0.25),
-                disp.get("arrow_head_angle", 0.5), disp.get("arrow_width", 0.001)
+                view.field_min_log, view.field_max_log, *self.arrow_style
             )
 
     def render(self, canvas, pos_tensor, num_active, cam_x, cam_y, zoom, color_map_tensor, min_log, max_log, zoom_intensity_scale, overlay=None):
@@ -277,24 +204,8 @@ class MeshRenderer:
         self._present(canvas, colorize(view_dens_tensor.t(), color_map_tensor, min_log, max_log, float(scale)), overlay)
 
     def _present(self, canvas, image, overlay):
-        """
-        image: (VIEW_W, VIEW_H) packed RGBA8 int32 on the sim device, GGUI [x, y] layout, y = 0 at the bottom.
-
-        The frame is copied once into a persistent host buffer and handed to GGUI as a host-mapped uint32 image:
-        exactly what Taichi's own Canvas.set_image does after its to_rgba8 conversion, minus that conversion and
-        the field.from_torch upload (two Taichi kernel launches and two Vulkan waits per frame; AUDIT §8 F01).
-        """
-        if overlay is not None:
-            thumb, thumb_w, thumb_h = overlay
-            w, h = min(thumb_w, VIEW_W), min(thumb_h, VIEW_H)
-            image[:w, :h] = thumb[:w, :h]
-        self._host.copy_(image)
-        py_canvas = getattr(canvas, "canvas", None)
-        if py_canvas is not None and hasattr(py_canvas, "set_image"):
-            py_canvas.set_image(self._host_info)
-        else:  # public-API fallback (e.g. a future Taichi without the PyCanvas attribute)
-            rgb = np.ascontiguousarray(self._host_np.view(np.uint8).reshape(VIEW_W, VIEW_H, 4)[..., :3])
-            canvas.set_image(rgb)
+        """image: (VIEW_W, VIEW_H) packed RGBA8 int32 on the sim device (see HostFramePresenter.present)."""
+        self._presenter.present(canvas, image, overlay)
 
     def render_vectors(self, canvas, fx_grid, fy_grid, camera, universe_w, universe_h, color_map_tensor, min_log, max_log,
                        length_scale, head_size, head_angle, width):

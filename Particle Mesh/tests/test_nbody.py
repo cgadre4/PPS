@@ -2,8 +2,8 @@
 import pytest
 import torch
 
-import engine as E
-from nbody_solver import DirectNBodySolver
+from particle_mesh.physics import engine as E
+from particle_mesh.physics.nbody_solver import DirectNBodySolver
 
 
 @pytest.mark.parametrize("potential", ["gravity", "harmonic", "lennard_jones", "coulomb"])

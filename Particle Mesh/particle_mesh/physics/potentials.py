@@ -1,7 +1,7 @@
 import torch
 import math
 
-from grid_ops import neg_gradient
+from particle_mesh.physics.grid_ops import neg_gradient
 
 
 class PotentialsManager:

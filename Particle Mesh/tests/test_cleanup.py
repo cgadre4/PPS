@@ -4,8 +4,8 @@ import time
 import pytest
 import torch
 
-import engine as E
-from nbody_solver import DirectNBodySolver
+from particle_mesh.physics import engine as E
+from particle_mesh.physics.nbody_solver import DirectNBodySolver
 
 
 def test_kernels_are_half_spectrum_and_real_where_possible(make_engine):

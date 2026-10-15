@@ -2,9 +2,9 @@
 import pytest
 import torch
 
-import engine as E
-import kernels as K
-from grid_ops import neg_gradient
+from particle_mesh.physics import engine as E
+from particle_mesh import kernels as K
+from particle_mesh.physics.grid_ops import neg_gradient
 
 
 @pytest.mark.parametrize("periodic", [True, False], ids=["periodic", "clamped"])

@@ -25,7 +25,7 @@ def test_pm_loop_with_fft_minimap():
 
 
 def test_nbody_loop_spawn_is_capped():
-    import engine as E
+    from particle_mesh.physics import engine as E
     r = _run("nbody")
     assert r["solver"] == "nbody"
     assert r["num_active"] <= E.NBODY_MAX_PARTICLES

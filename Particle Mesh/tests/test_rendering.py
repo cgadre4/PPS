@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-import mesh_renderer as MR
-from camera import SimulationCamera
+from particle_mesh.render import mesh_renderer as MR
+from particle_mesh.render.camera import SimulationCamera
 
 
 def test_splat_colormap_and_overlay_reach_the_frame(make_engine, headless_canvas):

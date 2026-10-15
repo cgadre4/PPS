@@ -1,45 +1,50 @@
 import time
 import torch
 import math
-from config import CONFIG
-from potentials import PotentialsManager
-from nbody_solver import DirectNBodySolver
-from pm_solver import ParticleMeshSolver
-from kernels import make_backend
-from kernels_torch import _const as const_tensor
+from particle_mesh.settings import CONFIG, SETTINGS  # noqa: F401  (CONFIG re-exported)
+from particle_mesh.physics.potentials import PotentialsManager
+from particle_mesh.physics.nbody_solver import DirectNBodySolver
+from particle_mesh.physics.pm_solver import ParticleMeshSolver
+from particle_mesh.kernels import make_backend
+from particle_mesh.runtime.device import const_tensor, get_torch_device
+from particle_mesh.view_state import VIEW_FIELDS, ViewState
 
-WIDTH = CONFIG["display"]["WIDTH"]
-HEIGHT = CONFIG["display"]["HEIGHT"]
-FPS_TARGET = CONFIG["display"]["FPS_TARGET"]
+WIDTH = SETTINGS.width
+HEIGHT = SETTINGS.height
+FPS_TARGET = SETTINGS.fps_target
 
-PHYSICS_GRID_W = CONFIG["simulation"].get("PHYSICS_GRID_W", 7680)
-PHYSICS_GRID_H = CONFIG["simulation"].get("PHYSICS_GRID_H", 7680)
-PHYSICS_CELL_SIZE = CONFIG["simulation"]["PHYSICS_CELL_SIZE"]
-MAX_PARTICLES = CONFIG["simulation"]["MAX_PARTICLES"]
+PHYSICS_GRID_W = SETTINGS.grid_w
+PHYSICS_GRID_H = SETTINGS.grid_h
+PHYSICS_CELL_SIZE = SETTINGS.physics_cell_size
+MAX_PARTICLES = SETTINGS.max_particles
 # Thermal spawn velocity spread for non-gravity potentials (at spawn_velocity = 1)
 THERMAL_SPEED = 1250.0
 # Direct N-body is O(N^2) work per step. With the fused Taichi kernel ~25k is interactive on the Arc B390
 # (10k ~5 ms, 20k ~8-10 ms, 40k ~30 ms per step); the tiled torch fallback is ~30-100x slower.
-NBODY_MAX_PARTICLES = CONFIG["simulation"].get("NBODY_MAX_PARTICLES", 25000)
+NBODY_MAX_PARTICLES = SETTINGS.nbody_max_particles
 # Slider-driven kernel rebuilds wait until the value has been still this long (seconds)
 KERNEL_REBUILD_DELAY = 0.15
 
-UNIVERSE_W = int(PHYSICS_GRID_W * PHYSICS_CELL_SIZE)
-UNIVERSE_H = int(PHYSICS_GRID_H * PHYSICS_CELL_SIZE)
+POTENTIALS = ('gravity', 'lennard_jones', 'harmonic', 'coulomb')
+PRESSURE_MODELS = ('none', 'isothermal', 'polytropic')
+
+UNIVERSE_W = SETTINGS.universe_w
+UNIVERSE_H = SETTINGS.universe_h
 GRID_W = PHYSICS_GRID_W
 GRID_H = PHYSICS_GRID_H
 
-def _get_torch_device():
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        return torch.device("xpu")
-    return torch.device("cpu")
+DEVICE = get_torch_device()
 
-DEVICE = _get_torch_device()
+def _forward_to_view(name):
+    return property(lambda self: getattr(self.view, name), lambda self, value: setattr(self.view, name, value))
+
 
 class SimulationEngine:
-    def __init__(self, initial_particles=None):
+    def __init__(self, initial_particles=None, solver=None):
+        """
+        initial_particles: startup count (default: config initial_particles). solver: 'pm' or 'nbody' (default:
+        config SOLVER). In N-body mode the startup count is capped at NBODY_MAX_PARTICLES.
+        """
         self.device = DEVICE
         self.width = WIDTH
         self.height = HEIGHT
@@ -47,50 +52,39 @@ class SimulationEngine:
         self.universe_h = UNIVERSE_H
         
         # Solver & Mode Settings
-        self.solver_type = CONFIG["simulation"].get("SOLVER", "pm").lower()
+        self.solver_type = (solver or SETTINGS.solver).lower()
         self.potential_type = 'gravity' # 'gravity', 'lennard_jones', 'harmonic'
         self.pressure_model = 'none' # 'none', 'isothermal', 'polytropic'
         self.boundary_mode = 'periodic' # 'periodic' (wrap around, matches the FFT solver), 'reflective_walls'
         
-        # Load custom sliders from config
-        sliders = CONFIG.get("sliders", {})
-        
         # Physics Parameters
-        self.G = sliders.get("gravity", [0.01, 100.0, 0.01])[2]
-        self.gravity_range = sliders.get("gravity_range", [1.0, 8192.0, 8192.0])[2] # Screen range
-        self.friction = sliders.get("friction", [0.0, 5.0, 0.2])[2] # Friction damping
+        self.G = SETTINGS.slider("gravity")[2]
+        self.gravity_range = SETTINGS.slider("gravity_range")[2] # Screen range
+        self.friction = SETTINGS.slider("friction")[2] # Friction damping
         
-        self.pressure_strength = sliders.get("pressure", [0.01, 10000.0, 0.0])[2]
-        self.gamma = sliders.get("polytropic_gamma", [0.0, 3.0, 1.0])[2]
+        self.pressure_strength = SETTINGS.slider("pressure")[2]
+        self.gamma = SETTINGS.slider("polytropic_gamma")[2]
         
-        self.spring_k = sliders.get("spring_k", [0.001, 10.0, 0.1])[2]
-        self.epsilon = sliders.get("epsilon", [1.0, 5000.0, 1000.0])[2]
-        self.sigma = sliders.get("sigma", [1.0, 200.0, 40.0])[2]
-        self.softening_length = sliders.get("softening_length", [0.1, 10.0, 1.5])[2]
+        self.spring_k = SETTINGS.slider("spring_k")[2]
+        self.epsilon = SETTINGS.slider("epsilon")[2]
+        self.sigma = SETTINGS.slider("sigma")[2]
+        self.softening_length = SETTINGS.slider("softening_length")[2]
         
-        self.uniform_gravity_mag = sliders.get("uniform_gravity_mag", [0.0, 2000.0, 0.0])[2]
-        self.uniform_gravity_angle = sliders.get("uniform_gravity_angle", [0.0, 360.0, 270.0])[2]
+        self.uniform_gravity_mag = SETTINGS.slider("uniform_gravity_mag")[2]
+        self.uniform_gravity_angle = SETTINGS.slider("uniform_gravity_angle")[2]
         
         self.uniform_spawn = False
         
-        # Rendering & Visualization States
-        self.show_fft = CONFIG["simulation"].get("show_fft", True)
-        self.use_bandpass_render = False
-        self.show_potential = False
-        self.show_field = False
-        
-        self.pot_min_log = sliders.get("potential_min_log", [-5.0, 10.0, 2.0])[2]
-        self.pot_max_log = sliders.get("potential_max_log", [-5.0, 15.0, 6.0])[2]
-        self.field_min_log = sliders.get("field_min_log", [-5.0, 10.0, 0.0])[2]
-        self.field_max_log = sliders.get("field_max_log", [-5.0, 10.0, 3.0])[2]
-        
-        self.bp_inner = sliders.get("bp_inner", [-0.5, 5.0, -0.5])[2]
-        self.bp_outer = sliders.get("bp_outer", [-0.5, 5.0, 5.0])[2]
-        self.bp_transition = sliders.get("bp_transition", [0.001, 1.0, 0.1])[2]
+        # Rendering & Visualization States (view toggles, colour ranges, band-pass, theme)
+        self.view = ViewState.from_settings()
         
         # Particle State Tensors
         if initial_particles is None:
-            initial_particles = CONFIG["simulation"].get("initial_particles", 10000 if self.solver_type == 'nbody' else 1000000)
+            initial_particles = SETTINGS.initial_particles
+        if self.solver_type == 'nbody' and initial_particles > NBODY_MAX_PARTICLES:
+            print(f"[Warning] initial_particles ({initial_particles}) is extremely high for O(N^2) Direct N-Body mode.")
+            print(f"          Capping to NBODY_MAX_PARTICLES ({NBODY_MAX_PARTICLES}) to prevent a hang or out-of-memory error.")
+            initial_particles = NBODY_MAX_PARTICLES
         self.num_active = initial_particles
         self.pos = torch.zeros((MAX_PARTICLES, 2), device=self.device)
         self.vel = torch.zeros((MAX_PARTICLES, 2), device=self.device)
@@ -107,16 +101,16 @@ class SimulationEngine:
         # Particle-kernel backend: Taichi on shared memory (CUDA/CPU), pure PyTorch otherwise (Intel XPU)
         self.kernels = make_backend(
             self.device,
-            CONFIG["simulation"].get("KERNEL_BACKEND", "auto"),
-            CONFIG["simulation"].get("TORCH_COMPILE", False)
+            SETTINGS.kernel_backend,
+            SETTINGS.torch_compile
         )
         # Re-sort particles by grid cell every N steps so CIC scatter/gather hit memory coherently (0 = off)
-        self.sort_interval = CONFIG["simulation"].get("SORT_INTERVAL", 50)
+        self.sort_interval = SETTINGS.sort_interval
         self.step_count = 0
         # Pending slider-driven kernel rebuild (see request_kernel_rebuild)
         self._kernel_dirty_since = None
         # Opt-in multi-rate PM: rebuild the field (deposit + FFT) every FIELD_INTERVAL steps; 1 = every step
-        self.field_interval = max(1, int(CONFIG["simulation"].get("FIELD_INTERVAL", 1)))
+        self.field_interval = SETTINGS.field_interval
         self._field_dirty = True       # particles added/removed or kernel changed since the last field solve
         # Freshly spawned gravity disks waiting for their orbit speeds: (start, end, centre_x, centre_y, vel_mult).
         # Applied inside step() from that step's own field, so spawning needs no second solve (AUDIT §8 F04).
@@ -136,7 +130,7 @@ class SimulationEngine:
         self.pot_manager = PotentialsManager(GRID_W, GRID_H, PHYSICS_CELL_SIZE, self.device)
         # Direct N-body: fused Taichi kernel by default, tiled torch path if NBODY_KERNEL is "torch"
         self.nbody_solver = DirectNBodySolver(
-            self.device, use_taichi=str(CONFIG["simulation"].get("NBODY_KERNEL", "auto")).lower() != "torch")
+            self.device, use_taichi=SETTINGS.nbody_kernel != "torch")
         self.pm_solver = ParticleMeshSolver(GRID_W, GRID_H, PHYSICS_CELL_SIZE, self.device, self.pot_manager, self.kernels)
 
     @property
@@ -186,6 +180,26 @@ class SimulationEngine:
         self._kernel_dirty_since = None
         self._field_dirty = True
         self.pm_solver.update_kernel(self.potential_type, self._physics_params())
+
+    # ------------------------------------------------------------------ commands (called by the GUI panel)
+
+    def set_potential(self, kind):
+        """Switch the interaction potential. Resets every particle's mass/charge (random +/-1 charges for Coulomb,
+        1 otherwise) and rebuilds the kernel immediately."""
+        if kind not in POTENTIALS:
+            raise ValueError(f"Unknown potential: {kind}")
+        self.potential_type = kind
+        self.masses[:self.num_active] = self._new_masses(self.num_active)
+        self.precompute_kernel()
+
+    def set_pressure_model(self, model):
+        if model not in PRESSURE_MODELS:
+            raise ValueError(f"Unknown pressure model: {model}")
+        self.pressure_model = model
+
+    def toggle_boundary(self):
+        """Switch between the periodic (wrapped) universe and reflective walls."""
+        self.boundary_mode = 'periodic' if self.boundary_mode == 'reflective_walls' else 'reflective_walls'
 
     def capacity(self):
         """
@@ -412,3 +426,8 @@ class SimulationEngine:
         # Apply fluid dampening cooling (if Lennard-Jones active in N-body mode)
         if self.potential_type == 'lennard_jones' and self.solver_type == 'nbody':
             self.vel[:n] *= 0.99
+
+
+# View toggles, colour ranges, band-pass and theme live in engine.view (a ViewState); engine.<name> forwards to it
+for _name in VIEW_FIELDS:
+    setattr(SimulationEngine, _name, _forward_to_view(_name))

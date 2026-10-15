@@ -15,27 +15,47 @@ Both backends expose the same methods, used by the PM solver, the engine and the
 "torch":  pure PyTorch on the torch device (fused grid_sample CIC). Used for Intel XPU, where Taichi (Vulkan)
           cannot see torch memory.
 """
-import taichi as ti
+from typing import Protocol
+
 import torch
 
-import kernels_torch as KT
-import kernels_taichi as KTI
+from particle_mesh.kernels import torch_impl as KT
+from particle_mesh.kernels import taichi_impl as KTI
+from particle_mesh.runtime.device import taichi_shares_memory, to_taichi  # noqa: F401  (re-exported)
 
 
-def taichi_shares_memory(device):
-    """True when Taichi kernels can read/write tensors on `device` without host round-trips."""
-    arch = ti.lang.impl.current_cfg().arch
-    if device.type == 'cuda':
-        return arch == ti.cuda
-    if device.type == 'cpu':
-        return arch in (ti.x64, ti.arm64)
-    return False
+class ParticleKernels(Protocol):
+    """The interface both backends implement (documentation; the backends are duck-typed)."""
+    name: str
+
+    def prepare(self, pos, n, cell_size, grid_w, grid_h, periodic): ...
+    def deposit(self, stencil, pos, mass, n, density, cell_size, periodic): ...
+    def force_buffers(self, grid_h, grid_w, device): ...
+    def gather_integrate(self, stencil, pos, vel, mass, n, fx, fy, cell_size, dt, damping, use_charge,
+                         periodic, universe_w, universe_h, accel_x=None, accel_y=None,
+                         uniform_accel=(0.0, 0.0)): ...
+    def wrap(self, pos, n, universe_w, universe_h): ...
+    def splat_view(self, pos, n, cam_x, cam_y, zoom, view_w, view_h, render_cell_size): ...
 
 
-def to_taichi(tensor):
-    """Tensor to hand to field.from_torch(): as-is when Taichi shares its memory, else one explicit host copy
-    (passing a device tensor would make Taichi copy it to the host AND back again after the kernel)."""
-    return tensor if taichi_shares_memory(tensor.device) else tensor.cpu()
+def nbody_accel(pos, masses, kind_id, strength, spring_k_over_n, epsilon, sigma, soft2, inv_range, periodic,
+                universe_w, universe_h):
+    """
+    Direct N-body accelerations with the fused Taichi kernel (taichi_impl.nbody_accel_kernel); returns (ax, ay)
+    on pos.device. Zero-copy where Taichi shares memory with torch (CUDA, CPU). Otherwise (torch XPU + Taichi
+    Vulkan) it hops through small CPU tensors: N-body counts are small (8 bytes of position per particle), so
+    that hop is cheap, unlike the PM grids. This module is the only place particle Taichi kernels are launched.
+    """
+    N = len(pos)
+    shared = taichi_shares_memory(pos.device)
+    p = pos.contiguous() if shared else pos.to('cpu').contiguous()
+    m = masses.contiguous() if shared else masses.to('cpu').contiguous()
+    acc = torch.empty((N, 2), dtype=torch.float32, device=p.device)
+    KTI.nbody_accel_kernel(p, m, acc, N, kind_id, strength, spring_k_over_n, epsilon, sigma, soft2, inv_range,
+                           periodic, universe_w, universe_h)
+    if not shared:
+        acc = acc.to(pos.device)
+    return acc[:, 0], acc[:, 1]
 
 
 def _with_eager_fallback(fn, compiled):
