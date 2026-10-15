@@ -1,34 +1,20 @@
+import os
+import json
 import taichi as ti
+import torch
 
-# --- TAICHI RENDER FIELDS (Zero-Copy Bridge) ---
-MAX_RENDER_PARTICLES = 290000  
+from kernels import to_taichi
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
+with open(CONFIG_PATH, 'r') as f:
+    CONFIG = json.load(f)
+
+# --- TAICHI RENDER FIELDS (GGUI vertex buffers) ---
+# Only N-body mode draws circles, and it is capped at NBODY_MAX_PARTICLES, so size the buffers to that
+MAX_RENDER_PARTICLES = min(290000, CONFIG["simulation"].get("NBODY_MAX_PARTICLES", 10000))
 render_pos_field = ti.Vector.field(2, dtype=ti.f32, shape=MAX_RENDER_PARTICLES)
 render_color_field = ti.Vector.field(3, dtype=ti.f32, shape=MAX_RENDER_PARTICLES)
 
-@ti.kernel
-def copy_to_taichi_kernel(
-    pos_arr: ti.types.ndarray(), 
-    color_arr: ti.types.ndarray(), 
-    num_particles: ti.i32,
-    cam_x: ti.f32,
-    cam_y: ti.f32,
-    screen_w: ti.f32,
-    screen_h: ti.f32
-):
-    for i in render_pos_field:
-        if i < num_particles:
-            # Mathematical translation & normalization directly on the GPU shader!
-            render_pos_field[i] = [(pos_arr[i, 0] - cam_x) / screen_w, 
-                                   (pos_arr[i, 1] - cam_y) / screen_h]
-            # Normalize colors instantly without PyTorch memory allocation
-            render_color_field[i] = [color_arr[i, 0] / 255.0, 
-                                     color_arr[i, 1] / 255.0, 
-                                     color_arr[i, 2] / 255.0]
-        else:
-            # Teleport inactive particles off-screen
-            render_pos_field[i] = [-10.0, -10.0]
-
-import torch
 
 class CircleRenderer:
     def __init__(self):
@@ -36,49 +22,30 @@ class CircleRenderer:
 
     def render(self, canvas, pos_tensor, color_tensor, num_active, cam_x, cam_y, screen_w, screen_h, particle_radius):
         """
-        Runs the zero-copy copy kernel to GGUI vertex fields, and draws circle primitives.
-        Only renders particles that are on the screen.
+        Normalises on-screen particles to [0, 1] screen space on the sim device, uploads them to the GGUI
+        vertex buffers and draws circle primitives. screen_w / screen_h are the visible world extent.
         """
         if num_active == 0:
             return
-            
-        # Get mask of particles within camera viewport in world space (fully on GPU)
-        pos_on_screen = (pos_tensor[:num_active, 0] >= cam_x) & (pos_tensor[:num_active, 0] <= cam_x + screen_w) & \
-                        (pos_tensor[:num_active, 1] >= cam_y) & (pos_tensor[:num_active, 1] <= cam_y + screen_h)
-        
-        on_screen_indices = torch.nonzero(pos_on_screen).squeeze(1)
-        num_on_screen = len(on_screen_indices)
-        num_to_draw = min(num_on_screen, MAX_RENDER_PARTICLES)
-        
-        if num_to_draw > 0:
-            on_screen_indices = on_screen_indices[:num_to_draw]
-            pos_to_draw = pos_tensor[on_screen_indices]
-            color_to_draw = color_tensor[on_screen_indices]
-            
-            # Pass PyTorch tensors directly in VRAM to Taichi fields
-            copy_to_taichi_kernel(
-                pos_to_draw, 
-                color_to_draw, 
-                num_to_draw, 
-                float(cam_x), 
-                float(cam_y), 
-                float(screen_w), 
-                float(screen_h)
-            )
-        else:
-            # Teleport all render vertices off-screen if nothing is visible
-            copy_to_taichi_kernel(
-                pos_tensor, 
-                color_tensor, 
-                0, 
-                float(cam_x), 
-                float(cam_y), 
-                float(screen_w), 
-                float(screen_h)
-            )
-        
+        device = pos_tensor.device
+        p = pos_tensor[:num_active]
+        u = (p[:, 0] - cam_x) / screen_w
+        v = (p[:, 1] - cam_y) / screen_h
+        on_screen = torch.nonzero((u >= 0) & (u <= 1) & (v >= 0) & (v <= 1)).squeeze(1)[:MAX_RENDER_PARTICLES]
+        count = on_screen.numel()
+
+        # Unused slots are parked off-screen
+        pos_buf = torch.full((MAX_RENDER_PARTICLES, 2), -10.0, device=device)
+        col_buf = torch.zeros((MAX_RENDER_PARTICLES, 3), device=device)
+        if count > 0:
+            pos_buf[:count, 0] = u[on_screen]
+            pos_buf[:count, 1] = v[on_screen]
+            col_buf[:count] = color_tensor[on_screen] / 255.0
+
+        render_pos_field.from_torch(to_taichi(pos_buf))
+        render_color_field.from_torch(to_taichi(col_buf))
         canvas.circles(
-            render_pos_field, 
-            radius=particle_radius, 
+            render_pos_field,
+            radius=particle_radius,
             per_vertex_color=render_color_field
         )

@@ -113,7 +113,7 @@ class SimulationGUI:
         bound_text = "SOLID WALL BOUNCE" if self.engine.boundary_mode == 'reflective_walls' else "UNIVERSE WRAPPED"
         if gui.button(f"Boundary: {bound_text}"):
             if self.engine.boundary_mode == 'reflective_walls':
-                self.engine.boundary_mode = 'wrap_delete'
+                self.engine.boundary_mode = 'periodic'
             else:
                 self.engine.boundary_mode = 'reflective_walls'
                 
