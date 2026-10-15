@@ -18,8 +18,9 @@ PHYSICS_CELL_SIZE = CONFIG["simulation"]["PHYSICS_CELL_SIZE"]
 MAX_PARTICLES = CONFIG["simulation"]["MAX_PARTICLES"]
 # Thermal spawn velocity spread for non-gravity potentials (at spawn_velocity = 1)
 THERMAL_SPEED = 1250.0
-# Direct N-body is O(N^2) work per step (memory is tiled, so speed is the limit: ~10k is interactive on an iGPU)
-NBODY_MAX_PARTICLES = CONFIG["simulation"].get("NBODY_MAX_PARTICLES", 10000)
+# Direct N-body is O(N^2) work per step. With the fused Taichi kernel ~25k is interactive on the Arc B390
+# (10k ~5 ms, 20k ~8-10 ms, 40k ~30 ms per step); the tiled torch fallback is ~30-100x slower.
+NBODY_MAX_PARTICLES = CONFIG["simulation"].get("NBODY_MAX_PARTICLES", 25000)
 # Slider-driven kernel rebuilds wait until the value has been still this long (seconds)
 KERNEL_REBUILD_DELAY = 0.15
 
@@ -133,7 +134,9 @@ class SimulationEngine:
 
         # Initialize helper managers and solvers
         self.pot_manager = PotentialsManager(GRID_W, GRID_H, PHYSICS_CELL_SIZE, self.device)
-        self.nbody_solver = DirectNBodySolver(self.device)
+        # Direct N-body: fused Taichi kernel by default, tiled torch path if NBODY_KERNEL is "torch"
+        self.nbody_solver = DirectNBodySolver(
+            self.device, use_taichi=str(CONFIG["simulation"].get("NBODY_KERNEL", "auto")).lower() != "torch")
         self.pm_solver = ParticleMeshSolver(GRID_W, GRID_H, PHYSICS_CELL_SIZE, self.device, self.pot_manager, self.kernels)
 
     @property

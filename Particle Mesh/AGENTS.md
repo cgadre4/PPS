@@ -42,9 +42,9 @@ uv run python main.py
 - **Headless technique:** wrap `ti.ui.Window` with `show_window=False`, stub the input methods, and read `get_image_buffer_as_numpy()`. Don't call `window.show()` without a visible window; it crashes. GGUI supports one window per process.
 - There is no build step or linter.
 - Don't set `PYTORCH_CUDA_ALLOC_CONF`/expandable segments for non-CUDA builds. PyTorch applies it to XPU too, and it measured ~15-20% slower (`main.py` only sets it when `torch.version.cuda`).
-- In `nbody` mode, `simulation.NBODY_MAX_PARTICLES` (default 10,000) caps both the startup count and brush/image spawning (`SimulationEngine.capacity()`).
-  - The solver is tiled (`TILE_ELEMENTS` per tile), so memory stays ~0.13 GiB at any N.
-  - The limit is O(N²) speed: on the B390, 10k ≈ 146 ms/step and 20k ≈ 630 ms. Raise the cap on bigger GPUs.
+- In `nbody` mode, `simulation.NBODY_MAX_PARTICLES` (default 25,000) caps both the startup count and brush/image spawning (`SimulationEngine.capacity()`).
+  - The limit is O(N²) speed. With the default fused Taichi kernel on the B390: 10k ≈ 5 ms/step, 20k ≈ 8–10 ms, 40k ≈ 30 ms.
+  - `NBODY_KERNEL: "torch"` selects the tiled PyTorch reference (memory ~0.13 GiB at any N, but ~30–100× slower: 10k ≈ 150 ms). Lower the cap if you use it.
 - `config.py` is the only module that reads `config.json`; import `CONFIG` from it.
 - Mouse-wheel input doesn't exist in Taichi 1.7 GGUI. Zoom and brush size use Z+drag and the arrow keys.
 
@@ -79,7 +79,7 @@ The next speed-up is fused Triton kernels / `torch.compile` (`AUDIT.md` §5.4 op
   - `TAICHI_BACKEND`, `KERNEL_BACKEND` (`"auto"`/`"torch"`/`"taichi"`), `TORCH_COMPILE`.
   - `SORT_INTERVAL`: re-sort particles by grid tile every N PM steps; 0 disables.
   - `FIELD_INTERVAL`: opt-in multi-rate PM. Rebuild the field (deposit + FFT) every N steps and reuse it in between; spawns and erases force a rebuild. Default 1.
-  - `NBODY_MAX_PARTICLES`, grid size, `PHYSICS_CELL_SIZE`, `RENDER_CELL_SIZE`, particle limits, log-density colour range.
+  - `NBODY_MAX_PARTICLES`, `NBODY_KERNEL` (`"auto"`/`"taichi"` = fused Taichi kernel, `"torch"` = tiled reference), grid size, `PHYSICS_CELL_SIZE`, `RENDER_CELL_SIZE`, particle limits, log-density colour range.
   - The checked-in values are sized for the B390: 2048² grid, 4M max particles, 1M at startup. The 2048² float32 grid is 16 MB, which fits the 16 MB last-level cache; 4096² makes CIC ~9× slower per particle.
 - `sliders`: every entry is `[min, max, default]`. `engine.py` reads index `[2]` for defaults; `gui.py` reads `[0]`/`[1]` for slider bounds. A new tunable parameter should follow this convention.
 
@@ -135,7 +135,10 @@ Frame loop (`main.py`): input handling -> brush spawn/erase -> `engine.step(dt)`
   - `K_eff` is rebuilt automatically when `K_k` (tracked by a version counter, not `id()`) or the softening length changes.
   - Kernels and `k_sq` are stored in **rfft2 half-spectrum layout** `(H, W//2+1)`. Gravity/Coulomb `K_k` is real; harmonic/LJ is the complex `rfft2` of `V(r)`. `pm_solver.k_sq` is the same tensor as `pot_manager.k_sq`. The real-space distance grid is built on demand only.
   - GUI sliders call `engine.request_kernel_rebuild()`, which is debounced: the rebuild runs in `step()` once the value has been still for `KERNEL_REBUILD_DELAY` (0.15 s). Call `precompute_kernel()` directly when an immediate rebuild is needed (e.g. switching potential).
-- **N-body solver (`nbody_solver.py`)** computes exact pairwise accelerations in PyTorch (any device), processing targets in row tiles of `TILE_ELEMENTS` against all sources, so memory is O(N·tile). Integration happens in `engine.step`.
+- **N-body solver (`nbody_solver.py`)** computes exact pairwise accelerations. Integration happens in `engine.step`.
+  - **Default:** one fused Taichi kernel (`kernels_taichi.nbody_accel_kernel`, one thread per target, no N×N temporaries). It's zero-copy where Taichi shares memory with torch. On the laptop it deliberately hops through small CPU tensors (8 B/particle), the one place where crossing between XPU and Vulkan is cheap.
+  - **Reference/fallback:** the tiled PyTorch path (`_solve_torch`, `TILE_ELEMENTS` per tile).
+  - `tests/test_nbody.py` checks that the two agree.
 - **Adding or changing a potential touches four places:** `potentials.get_fourier_kernel` (PM), `nbody_solver.solve` (N-body), `engine.precompute_kernel`/`step` param dicts, and the buttons/sliders in `gui.py`.
 
 ### Taichi initialisation order

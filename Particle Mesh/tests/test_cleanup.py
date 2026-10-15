@@ -34,8 +34,8 @@ def test_nbody_tiling_matches_single_tile(potential, periodic):
     pos[1] = pos[0] + 0.01                                             # near-coincident pair (clamps/softening)
     masses = torch.randint(0, 2, (N,), device=dev, dtype=torch.int8, generator=g) * 2 - 1
     params = dict(G=0.64, force_range=300.0, spring_k=0.1, epsilon=1000.0, sigma=20.0, softening_length=1.5)
-    whole = DirectNBodySolver(dev, tile_elements=N * N).solve(pos, masses, potential, params, periodic, 800.0, 800.0)
-    tiled = DirectNBodySolver(dev, tile_elements=N * 37).solve(pos, masses, potential, params, periodic, 800.0, 800.0)
+    whole = DirectNBodySolver(dev, tile_elements=N * N, use_taichi=False).solve(pos, masses, potential, params, periodic, 800.0, 800.0)
+    tiled = DirectNBodySolver(dev, tile_elements=N * 37, use_taichi=False).solve(pos, masses, potential, params, periodic, 800.0, 800.0)
     for a, b in zip(whole, tiled):
         assert torch.allclose(a, b, rtol=1e-4, atol=1e-3)
 
