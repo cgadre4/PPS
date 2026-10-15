@@ -351,8 +351,8 @@ A read-only multi-agent sweep produced these findings. Each one was then checked
 | F27 | Fold uniform gravity (and reflective walls) into the integrate pass | step | 0.5–4 ms in those modes | Done (PR #9): uniform gravity in the kick; vectorised reflective bounce |
 | F32 | Opt-in multi-rate field update (`FIELD_INTERVAL`, default 1) | field | ~3 ms average at k = 2 if enabled | Done (PR #9): FIELD_INTERVAL, default 1 |
 | F41 | CUDA: smaller Taichi memory pool (`device_memory_GB`) | capacity | gives torch 1.5–3 GB back on CUDA | Done (PR #9): device_memory_GB=0.5 |
-| F36 | N-body: one fused Taichi kernel (zero-copy on CUDA, tiny CPU hop on Vulkan) | N-body | 7–30× at 10k; cap could rise to ~25–40k | Planned (perf PR 3) |
-| F33/F34 | N-body torch path: fewer passes per tile, symmetric tile pairs | N-body | ~1.5–2.5× | Planned (perf PR 3) |
+| F36 | N-body: one fused Taichi kernel (zero-copy on CUDA, tiny CPU hop on Vulkan) | N-body | 7–30× at 10k; cap could rise to ~25–40k | Done (PR #10): 10k 157 -> 4.9 ms, 20k 625 -> 8.4 ms; N-body cap raised 10k -> 25k |
+| F33/F34 | N-body torch path: fewer passes per tile, symmetric tile pairs | N-body | ~1.5–2.5× | Superseded by F36 (the torch path is now only the reference/fallback) |
 | F19, R4.1 | Opt-in config tradeoffs: 2048×1280 grid, `RENDER_CELL_SIZE` 3 | config | ~1.5–2.7 ms each | Documented option |
 | F05 | int32 stencil | step | ~1–1.6 ms at 1M | Not needed (F02 is faster) |
 | F06, F08, F17, F18, F28, F35, F47 | Single force buffer, pipelined present, direct ring VBO, render from density grid, fixed-size splat scatter, far-pair culling, Taichi colour expansion | various | ≤0.5 ms each, or scenario-dependent | Not pursued (uncertain or small) |

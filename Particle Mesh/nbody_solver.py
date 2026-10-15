@@ -1,28 +1,63 @@
 import torch
 
+import kernels_taichi as KTI
+from kernels import taichi_shares_memory
+
 # Elements per (tile_rows x N) pairwise tensor. Memory is O(N * tile) instead of O(N^2) (AUDIT 3.5).
 TILE_ELEMENTS = 1 << 22
+_KINDS = {'gravity': 0, 'coulomb': 1, 'harmonic': 2, 'lennard_jones': 3}
 
 
 class DirectNBodySolver:
-    def __init__(self, device, tile_elements=TILE_ELEMENTS):
+    def __init__(self, device, tile_elements=TILE_ELEMENTS, use_taichi=True):
         self.device = device
         self.tile_elements = tile_elements
+        # Fused Taichi kernel (AUDIT §8 F36) unless disabled; the tiled torch path is the fallback/reference
+        self.use_taichi = use_taichi
 
     def solve(self, pos, masses, potential_type, params, periodic=False, universe_w=None, universe_h=None):
         """
-        Computes exact O(N^2) pairwise accelerations (pure PyTorch, runs on any torch device), processing the
-        target particles in row tiles against all sources.
+        Computes exact O(N^2) pairwise accelerations. Returns (ax, ay), each (N,), on pos.device.
         periodic: use minimum-image displacements, matching the wrapped (toroidal) universe.
-
-        Self-interaction needs no masking: its displacement is exactly 0 and every force is softened/clamped,
-        so the self term contributes factor * 0 = 0.
         """
         N = len(pos)
         if N <= 1:
             return torch.zeros(N, device=self.device), torch.zeros(N, device=self.device)
-        if potential_type not in ('gravity', 'harmonic', 'lennard_jones', 'coulomb'):
+        if potential_type not in _KINDS:
             raise ValueError(f"Unknown potential type: {potential_type}")
+        if self.use_taichi:
+            return self._solve_taichi(pos, masses, potential_type, params, periodic, universe_w, universe_h)
+        return self._solve_torch(pos, masses, potential_type, params, periodic, universe_w, universe_h)
+
+    def _solve_taichi(self, pos, masses, potential_type, params, periodic, universe_w, universe_h):
+        """
+        One fused Taichi kernel: one thread per target, no N x N temporaries. Zero-copy where Taichi shares memory
+        with torch (CUDA, CPU). Otherwise (torch XPU + Taichi Vulkan) it hops through small CPU tensors. N-body
+        particle counts are small (8 bytes of position per particle), so that hop is cheap, unlike the PM grids.
+        """
+        N = len(pos)
+        shared = taichi_shares_memory(pos.device)
+        p = pos.contiguous() if shared else pos.to('cpu').contiguous()
+        m = masses.contiguous() if shared else masses.to('cpu').contiguous()
+        acc = torch.empty((N, 2), dtype=torch.float32, device=p.device)
+        KTI.nbody_accel_kernel(
+            p, m, acc, N, _KINDS[potential_type],
+            float(params.get('G', 1.0)), float(params.get('spring_k', 0.1)) / N,
+            float(params.get('epsilon', 1000.0)), float(params.get('sigma', 40.0)),
+            float(params.get('softening_length', 1.5)) ** 2, 1.0 / float(params.get('force_range', 8192.0)),
+            int(bool(periodic)), float(universe_w or 1.0), float(universe_h or 1.0)
+        )
+        if not shared:
+            acc = acc.to(pos.device)
+        return acc[:, 0], acc[:, 1]
+
+    def _solve_torch(self, pos, masses, potential_type, params, periodic, universe_w, universe_h):
+        """
+        Pure PyTorch reference (any torch device): target particles in row tiles against all sources.
+        Self-interaction needs no masking: its displacement is exactly 0 and every force is softened/clamped,
+        so the self term contributes factor * 0 = 0.
+        """
+        N = len(pos)
 
         px = pos[:, 0]
         py = pos[:, 1]

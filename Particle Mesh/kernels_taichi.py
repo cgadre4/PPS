@@ -96,6 +96,55 @@ def gather_integrate_kernel(
 
 
 @ti.kernel
+def nbody_accel_kernel(
+    pos: ti.types.ndarray(), mass: ti.types.ndarray(), acc: ti.types.ndarray(), num_active: ti.i32,
+    kind: ti.i32, strength: ti.f32, spring_k_over_n: ti.f32, epsilon: ti.f32, sigma: ti.f32,
+    soft2: ti.f32, inv_range: ti.f32, periodic: ti.i32, universe_w: ti.f32, universe_h: ti.f32
+):
+    """
+    Exact pairwise accelerations, one thread per target particle, same force laws as nbody_solver's torch path
+    (kind: 0 gravity, 1 Coulomb, 2 harmonic, 3 Lennard-Jones). Fused: no N x N temporaries at all.
+    The self term needs no special case: its displacement is exactly 0 and every force is softened/clamped.
+    """
+    for i in range(num_active):
+        xi = pos[i, 0]
+        yi = pos[i, 1]
+        ax = 0.0
+        ay = 0.0
+        for j in range(num_active):
+            dx = pos[j, 0] - xi
+            dy = pos[j, 1] - yi
+            if periodic != 0:
+                # minimum image
+                dx -= universe_w * ti.floor(dx / universe_w + 0.5)
+                dy -= universe_h * ti.floor(dy / universe_h + 0.5)
+            r2 = dx * dx + dy * dy + soft2
+            r = ti.sqrt(r2)
+            screen = ti.exp(-r * inv_range)
+            mj = ti.cast(mass[j], ti.f32)
+            f = 0.0
+            if kind == 0:
+                f = strength * mj * screen / r2
+            elif kind == 1:
+                f = -strength * mj * screen / r2
+            elif kind == 2:
+                f = spring_k_over_n * mj * screen
+            else:
+                s = sigma / r
+                s6 = s * s * s * s * s * s
+                force_mag = ti.min(ti.max(24.0 * epsilon / r * (2.0 * s6 * s6 - s6), -500000.0), 500000.0)
+                f = force_mag / r * mj * screen
+            ax += f * dx
+            ay += f * dy
+        if kind == 1:
+            q = ti.cast(mass[i], ti.f32)
+            ax *= q
+            ay *= q
+        acc[i, 0] = ax
+        acc[i, 1] = ay
+
+
+@ti.kernel
 def splat_view_kernel(
     pos: ti.types.ndarray(), out: ti.types.ndarray(), num_active: ti.i32,
     cam_x: ti.f32, cam_y: ti.f32, scale: ti.f32, view_w: ti.i32, view_h: ti.i32

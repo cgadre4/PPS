@@ -14,7 +14,8 @@
   },
   "simulation": {
     "MAX_PARTICLES": 4000000,
-    "NBODY_MAX_PARTICLES": 10000,
+    "NBODY_MAX_PARTICLES": 25000,
+    "NBODY_KERNEL": "auto",
     "KERNEL_BACKEND": "auto",
     "TORCH_COMPILE": false,
     "SORT_INTERVAL": 50,
