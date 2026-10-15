@@ -4,7 +4,7 @@ import math
 import pytest
 import torch
 
-import engine as E
+from particle_mesh.physics import engine as E
 
 CS = E.PHYSICS_CELL_SIZE
 

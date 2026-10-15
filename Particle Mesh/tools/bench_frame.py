@@ -10,7 +10,7 @@ packed present), offscreen.
   --app numbers are for A/B only: offscreen, GGUI work is never presented and the shared GPU stalls (~75 ms/frame at
   1M on the B390 for master and the refactor alike), so they are far above the real windowed frame time.
 
-Uses the same Taichi/torch/kernel backend selection as the app (imports main). Prints ms per stage.
+Uses the same Taichi/torch/kernel backend selection as the app (runtime.bootstrap). Prints ms per stage.
 Always A/B performance changes back to back (e.g. against a git worktree of master), never against stored numbers.
 """
 import argparse
@@ -22,14 +22,18 @@ PM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PM_DIR)
 os.chdir(PM_DIR)
 
-import main  # noqa: E402  (initialises Taichi like the app)
+from particle_mesh.runtime import bootstrap  # noqa: E402
+
+bootstrap.configure_torch_env()
+bootstrap.init_taichi()
+
 import taichi as ti  # noqa: E402
 import torch  # noqa: E402
-import engine as E  # noqa: E402
-import mesh_renderer as MR  # noqa: E402
-from camera import SimulationCamera  # noqa: E402
-from colors import THEMES  # noqa: E402
-from circle_renderer import CircleRenderer  # noqa: E402
+from particle_mesh.physics import engine as E  # noqa: E402
+from particle_mesh.render import mesh_renderer as MR  # noqa: E402
+from particle_mesh.render.camera import SimulationCamera  # noqa: E402
+from particle_mesh.render.themes import THEMES  # noqa: E402
+from particle_mesh.render.circle_renderer import CircleRenderer  # noqa: E402
 
 
 def _sync(device):

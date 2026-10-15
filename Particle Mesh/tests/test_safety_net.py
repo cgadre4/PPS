@@ -3,8 +3,8 @@ import numpy as np
 import pytest
 import torch
 
-import engine as E
-import mesh_renderer as MR
+from particle_mesh.physics import engine as E
+from particle_mesh.render import mesh_renderer as MR
 
 
 def reference_nbody_colors(engine, color_map):

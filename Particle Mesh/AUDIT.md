@@ -4,6 +4,8 @@ Audit date: 2026-10-15. Scope: every module (`main.py`, `engine.py`, `pm_solver.
 
 > **Which version this audits.** The line references in §1–§4 point to the June 2026 copy of the code, which was backed up to Google Drive from the CUDA machine. The version committed in this repo is the August 2026 copy. That copy changes `main.py`, `engine.py`, `pm_solver.py`, `nbody_solver.py`, `mesh_renderer.py` and `config.json` (XPU/Vulkan backend selection, absolute config paths, a smaller config), so line numbers in those files will be off. The findings still apply unless noted. §5.2 reviews the August changes specifically.
 
+> **Package layout.** Since the October 2026 refactor the modules live in the `particle_mesh/` package (`engine.py` → `particle_mesh/physics/engine.py`, `mesh_renderer.py` → `particle_mesh/render/mesh_renderer.py`, `gui.py` → `particle_mesh/ui/panel.py`, `kernels_torch.py` → `particle_mesh/kernels/torch_impl.py`, and so on; AGENTS.md has the full table). File and line references in §1–§5 use the old flat names.
+
 Severity: **High** = wrong results, crash, or a feature that silently does nothing. **Medium** = wrong in some settings, or a large waste of performance. **Low** = minor, cosmetic, or code quality.
 
 "Verified" means I reproduced the behaviour or confirmed it in library source. Everything else comes from reading the code.
@@ -105,7 +107,7 @@ The raw CIC density is also noisy (shot noise), and its gradient is noisier stil
 **Fix:** divide by `max(ρ, ε)` and smooth the density first. A Gaussian filter in k-space is free here, because `rho_k` is already computed.
 
 ### 2.10 Advanced views break when `RENDER_CELL_SIZE ≠ 1` (Medium)
-**Fixed** on branch `fix/render-cell-size-views`: `main.build_view_grid()` scales by `RENDER_CELL_SIZE` and samples at render-cell centres. The minimap sizing part was fixed in PR #1.
+**Fixed** on branch `fix/render-cell-size-views`: `build_view_grid()` (then in `main.py`, now `particle_mesh/render/viewport.py`) scales by `RENDER_CELL_SIZE` and samples at render-cell centres. The minimap sizing part was fixed in PR #1.
 
 `main.py:291-292` computes `world = screen_x / zoom + cam_x` with `screen_x` in render cells, not pixels. With `RENDER_CELL_SIZE = 2` (the setting in `C:\Python Dev\PPS\Particle Mesh\config.json`), the potential, bandpass and field views show the wrong quarter of the screen at 2× scale.
 
@@ -232,9 +234,11 @@ Every frame that a G, range, spring or LJ slider moves rebuilds the kernel. For 
 - **Relative `config.json` paths and import-time side effects.** `main.py`, `engine.py` and `mesh_renderer.py` each load the config with a relative path. `mesh_renderer.py` and `circle_renderer.py` allocate Taichi fields at import. One `config.py` with an absolute path (the August copy already does the path part) plus lazy field allocation would make the modules importable in tests.
   - *Status, PR #6:* `config.py` is now the only reader of `config.json`.
   - *Status, PR #7:* fields are now created by their owners after `ti.init()`, so modules import in any order (`tests/test_imports.py`).
+  - *Status, package refactor:* `particle_mesh/settings.py` reads the config (typed `SETTINGS`), and `main.py` no longer initialises Taichi at import; `runtime/bootstrap.init_taichi()` is the single, idempotent initialisation point.
 - **`main.py` does too much.** Input handling, view resampling, colouring and overlays all live in one 420-line loop. Move the PM view and overlay logic into `MeshRenderer` (which also fixes 2.1), and keep the key edge-trigger state in a dict.
   - *Status, PR #6:* the PM views, minimap, bandpass and arrows moved into `MeshRenderer.render_pm`, and `main.py` dropped ~110 lines.
   - *Status, PR #7:* the input edge-trigger flags are replaced by a `KeyEdges` helper.
+  - *Status, package refactor:* `main.py` is a ~30-line entry point. The loop is `particle_mesh/app.App.frame`; input is `ui/input.InputController`, N-body colouring is `CircleRenderer.render_nbody`, and overlays are `render/overlays.BrushOverlay`.
 - **No tests.** *Resolved (PR #4 onwards): `tests/`, run with `uv run pytest`, all headless.* Taichi's `ti.cpu` arch plus CPU tensors runs the real kernels with zero-copy, so headless physics checks are cheap:
   - Two-body force against the analytic 2D law, for PM and N-body: this catches the 2π mismatch.
   - Total momentum stays ~0 for a symmetric configuration.
@@ -305,7 +309,7 @@ Native GPU kernels with atomics should be roughly as fast as the Taichi Vulkan n
 1. Consolidate into one git repo (§4).
 2. ~~Quick correctness fixes: 2.3 damping, 2.7 `K[0,0] = 0`, 2.2 Coulomb charge, 2.4 N-body zoom, 2.5 N-body cap, 2.1 overlay order.~~ **Done** on branch `fix/quick-correctness`. That branch also fixed the minimap's size when `RENDER_CELL_SIZE ≠ 1` and the point-reflection mirroring. The redundant FFTs (3.3) were removed in PR #3; antialiasing is tracked in §7.
 3. ~~XPU option A, to get the app running on this laptop.~~ **Done** on branch `feat/xpu-port`. It adds a pure-PyTorch kernel backend with a shared CIC stencil, periodic cell sorting, all rendering in PyTorch, a 2048² grid, reuse of `rho_k`, a cached `K_eff` and a LUT colormap. Measured on the B390: 1M particles ≈ 17 ms/frame (≈59 FPS), 4M ≈ 42 ms. The old path took 115 ms for physics alone at 1M. CUDA machines keep the Taichi kernels via `kernels.TaichiBackend`; that path is parity-tested on Taichi CPU but not run on CUDA here.
-4. Install MSVC Build Tools and move to option B (Triton fused particle kernel). The hot paths are already isolated in `kernels_torch.py`, and `TORCH_COMPILE: true` will try `torch.compile` and fall back to eager if it fails. Benchmark against the numbers in step 3.
+4. Install MSVC Build Tools and move to option B (Triton fused particle kernel). The hot paths are already isolated in `kernels_torch.py` (now `particle_mesh/kernels/torch_impl.py`), and `TORCH_COMPILE: true` will try `torch.compile` and fall back to eager if it fails. Benchmark against the numbers in step 3.
 5. ~~Boundary model (2.8), pressure form (2.9), units and parity (2.11), and a small physics test suite.~~ **Done:** 2.8 in PR #3, the test suite in PR #4, 2.9/2.11/2.12 in PR #5. The cleanup items (6, 2.13, 3.1, 3.5, 3.6, §4) are in PR #6.
 
 The benchmarks were run with throwaway scripts (`bench_xpu.py`, `bench_xpu2.py`, `test_set_image_order.py`) that are not committed. Ask for them to be re-created under a `bench/` folder if needed.

@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-import engine as E
+from particle_mesh.physics import engine as E
 
 UW, UH = E.UNIVERSE_W, E.UNIVERSE_H
 CS = E.PHYSICS_CELL_SIZE

@@ -3,7 +3,7 @@ Taichi kernels are fed CPU tensors, which every Taichi arch accepts (copied when
 import pytest
 import torch
 
-import kernels as K
+from particle_mesh import kernels as K
 
 W, H, CS = 64, 48, 2.0
 UW, UH = W * CS, H * CS
@@ -64,7 +64,7 @@ def test_torch_gpu_matches_cpu(periodic):
 
 
 def test_backend_selection_never_hands_taichi_unshared_tensors():
-    import engine as E
+    from particle_mesh.physics import engine as E
     backend = K.make_backend(E.DEVICE, "auto")
     if K.taichi_shares_memory(E.DEVICE):
         assert backend.name == "taichi"

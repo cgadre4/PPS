@@ -1,9 +1,9 @@
 """
 Particle Mesh sandbox entry point:  uv run python main.py   (or  uv run python -m particle_mesh)
 
-The app itself lives in particle_mesh.app. The names below stay importable for tests and tools.
+The app itself lives in particle_mesh.app (which bootstraps torch and Taichi when it starts). Importing this module
+has no side effects; the names below stay importable for tests and tools.
 """
-from particle_mesh.runtime import bootstrap
 from particle_mesh.settings import CONFIG, SETTINGS  # noqa: F401  (re-exported)
 
 # Global Display Settings
@@ -12,14 +12,9 @@ HEIGHT = SETTINGS.height
 FPS_TARGET = SETTINGS.fps_target
 SOLVER_MODE = SETTINGS.solver
 
-bootstrap.configure_torch_env()
-# Taichi is initialised when this module is imported (tests and tools rely on `import main` doing it).
-_init_taichi = bootstrap.init_taichi
-_init_taichi()
-
-from particle_mesh import app  # noqa: E402
-from particle_mesh.physics.engine import SimulationEngine  # noqa: E402
-from particle_mesh.ui.input import KeyEdges  # noqa: E402,F401  (re-exported)
+from particle_mesh import app
+from particle_mesh.physics.engine import SimulationEngine
+from particle_mesh.ui.input import KeyEdges  # noqa: F401  (re-exported)
 
 
 def main():

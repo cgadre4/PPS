@@ -1,9 +1,9 @@
 """
 Shared test setup. Run from the Particle Mesh folder:  uv run pytest
 
-Importing `main` initialises Taichi exactly as the app does (CUDA, else Vulkan, ...) and imports the renderers,
-whose Taichi fields are allocated at import time. Everything runs headless; tests that need a full app loop
-(test_smoke.py) start it in a subprocess because GGUI supports one window per process.
+Taichi is initialised exactly as the app does it (runtime.bootstrap: CUDA, else Vulkan, ...). Everything runs
+headless; tests that need a full app loop (test_smoke.py) start it in a subprocess because GGUI supports one window
+per process.
 """
 import os
 import sys
@@ -14,9 +14,13 @@ PM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PM_DIR)
 os.chdir(PM_DIR)
 
-import main  # noqa: E402,F401  (side effect: ti.init + renderer field allocation)
+from particle_mesh.runtime import bootstrap  # noqa: E402
+
+bootstrap.configure_torch_env()
+bootstrap.init_taichi()
+
 import torch  # noqa: E402
-import engine as E  # noqa: E402
+from particle_mesh.physics import engine as E  # noqa: E402
 
 
 @pytest.fixture
@@ -37,7 +41,7 @@ def make_engine():
 def headless_canvas():
     """One offscreen GGUI window sized to the render-cell viewport (never call window.show() on it)."""
     import taichi as ti
-    import mesh_renderer as MR
+    from particle_mesh.render import mesh_renderer as MR
     window = ti.ui.Window("tests", (MR.VIEW_W, MR.VIEW_H), show_window=False)
     return window, window.get_canvas()
 
