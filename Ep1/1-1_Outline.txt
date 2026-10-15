@@ -1,0 +1,21 @@
+Episode 1 tutorial steps (chronological)
+
+MVP: Open a window + draw one particle (a circle) ✅ (we’ll code this now)
+
+Add a proper game loop: clear screen each frame + redraw
+
+Add quit handling (close window gracefully)
+
+Add a clock + cap FPS (stable rendering)
+
+Make the particle move with velocity (time-based motion)
+
+Add wall bounce
+
+Convert to fixed timestep physics (FPS-independent dynamics)
+
+Upgrade to Structure of Arrays (SoA) for scalability
+
+Add HUD (FPS, N) + reproducible seed
+
+Spawn many particles (still no collisions)

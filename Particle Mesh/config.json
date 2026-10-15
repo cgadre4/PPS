@@ -1,0 +1,138 @@
+{
+  "display": {
+    "WIDTH": 2880,
+    "HEIGHT": 1800,
+    "FPS_TARGET": 120.0,
+    "FONT_SIZE": 16,
+    "pixels_per_arrow": 32,
+    "arrow_width": 0.0002,
+    "arrow_length_scale": 1,
+    "arrow_head_size": 0.25,
+    "arrow_head_angle": 0.5,
+    "ui_width": 0.15
+  },
+  "simulation": {
+    "MAX_PARTICLES": 1000000,
+    "PHYSICS_GRID_W": 1440,
+    "PHYSICS_GRID_H": 1440,
+    "PHYSICS_CELL_SIZE": 2.0,
+    "RENDER_CELL_SIZE": 2.0,
+    "ZOOM_INTENSITY_SCALE": 0.01,
+    "MIN_LOG_DENSITY": 0.0,
+    "MAX_LOG_DENSITY": 3.0,
+    "SOLVER": "pm",
+    "initial_particles": 100
+  },
+  "sliders": {
+    "gravity": [
+      0.01,
+      100.0,
+      1.0
+    ],
+    "gravity_range": [
+      1.0,
+      8192.0,
+      100.0
+    ],
+    "friction": [
+      0.0,
+      5.0,
+      0.1
+    ],
+    "pressure": [
+      0.01,
+      10000.0,
+      1.0
+    ],
+    "softening_length": [
+      0.1,
+      10.0,
+      1.5
+    ],
+    "time_scale_log": [
+      -2.0,
+      2.0,
+      0.0
+    ],
+    "brush_radius": [
+      20.0,
+      1000.0,
+      500.0
+    ],
+    "spawn_velocity": [
+      -100.0,
+      100.0,
+      25.0
+    ],
+    "spawn_density": [
+      0.001,
+      2.0,
+      1.0
+    ],
+    "bp_inner": [
+      -0.5,
+      5.0,
+      -0.5
+    ],
+    "bp_outer": [
+      -0.5,
+      5.0,
+      5.0
+    ],
+    "bp_transition": [
+      0.001,
+      1.0,
+      0.1
+    ],
+    "potential_min_log": [
+      -2.0,
+      10.0,
+      2.0
+    ],
+    "potential_max_log": [
+      -2.0,
+      15.0,
+      6.0
+    ],
+    "field_min_log": [
+      -2.0,
+      10.0,
+      0.0
+    ],
+    "field_max_log": [
+      -2.0,
+      10.0,
+      3.0
+    ],
+    "spring_k": [
+      0.001,
+      10.0,
+      0.1
+    ],
+    "epsilon": [
+      1.0,
+      5000.0,
+      1000.0
+    ],
+    "sigma": [
+      1.0,
+      200.0,
+      40.0
+    ],
+    "polytropic_gamma": [
+      0.0,
+      3.0,
+      1.0
+    ],
+    "uniform_gravity_mag": [
+      0.0,
+      10000.0,
+      0.0
+    ],
+    "uniform_gravity_angle": [
+      0.0,
+      360.0,
+      270.0
+    ]
+  }
+}

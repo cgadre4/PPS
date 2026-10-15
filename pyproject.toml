@@ -1,0 +1,16 @@
+[project]
+name = "pps"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "pillow",
+    "pygame",
+    "taichi>=1.7.4",
+    "torch",
+    "torchvision",
+]
+
+[tool.uv]
+extra-index-url = ["https://download.pytorch.org/whl/xpu"]

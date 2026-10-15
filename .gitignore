@@ -1,0 +1,39 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Python virtual environment (uv recreates it from pyproject.toml + uv.lock)
+.venv/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Editor / IDE settings
+.vscode/
+.idea/
+
+# Claude Code per-user settings
+.claude/settings.local.json
+
+# Dear ImGui window layout, rewritten by Taichi GGUI on every run
+imgui.ini
+
+# Logs and profiler output
+*.log
+
+# Personal notes kept out of the repo
+convo.md
+
+# Office lock files
+~$*
+
+# Operating system junk
+.DS_Store
+Thumbs.db
+desktop.ini
