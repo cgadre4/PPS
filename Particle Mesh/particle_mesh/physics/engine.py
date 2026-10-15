@@ -6,7 +6,7 @@ from particle_mesh.physics.potentials import PotentialsManager
 from particle_mesh.physics.nbody_solver import DirectNBodySolver
 from particle_mesh.physics.pm_solver import ParticleMeshSolver
 from particle_mesh.kernels import make_backend
-from particle_mesh.kernels.torch_impl import _const as const_tensor
+from particle_mesh.runtime.device import const_tensor, get_torch_device
 
 WIDTH = CONFIG["display"]["WIDTH"]
 HEIGHT = CONFIG["display"]["HEIGHT"]
@@ -29,14 +29,7 @@ UNIVERSE_H = int(PHYSICS_GRID_H * PHYSICS_CELL_SIZE)
 GRID_W = PHYSICS_GRID_W
 GRID_H = PHYSICS_GRID_H
 
-def _get_torch_device():
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        return torch.device("xpu")
-    return torch.device("cpu")
-
-DEVICE = _get_torch_device()
+DEVICE = get_torch_device()
 
 class SimulationEngine:
     def __init__(self, initial_particles=None):

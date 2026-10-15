@@ -5,7 +5,7 @@ import torch
 from taichi.ui.utils import get_field_info
 
 from particle_mesh.settings import CONFIG
-from particle_mesh.kernels import to_taichi
+from particle_mesh.runtime.device import to_taichi
 
 WIDTH = CONFIG["display"]["WIDTH"]
 HEIGHT = CONFIG["display"]["HEIGHT"]

@@ -1,12 +1,5 @@
-import os
 import taichi as ti
 import torch
-
-# Expandable segments reduce VRAM fragmentation on CUDA. Only set it for CUDA builds: newer PyTorch applies the
-# same setting to Intel XPU, where it measured ~15-20% slower. The allocator reads it at its first allocation,
-# so setting it here (after import, before any tensor) still takes effect.
-if torch.version.cuda:
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import math
 import time
@@ -19,57 +12,11 @@ HEIGHT = CONFIG["display"]["HEIGHT"]
 FPS_TARGET = CONFIG["display"]["FPS_TARGET"]
 SOLVER_MODE = CONFIG["simulation"].get("SOLVER", "pm").lower()
 
-# Taichi is initialised when this module is imported (tests and tools rely on `import main` doing it). Modules no
-# longer allocate fields at import, so import order is free; ti.init() just has to run before an engine or renderer
-# is constructed (kernels.make_backend reads the active arch, renderers create their fields).
-def _init_taichi():
-    preferred = CONFIG.get("simulation", {}).get("TAICHI_BACKEND", None)
-    arch_map = {
-        "cuda": ti.cuda,
-        "vulkan": ti.vulkan,
-        "opengl": ti.opengl,
-        "cpu": ti.cpu
-    }
-    candidates = []
-    if preferred and str(preferred).lower() in arch_map:
-        candidates.append(arch_map[str(preferred).lower()])
-    
-    # Priority hierarchy:
-    # If CUDA is detected, try CUDA first.
-    # Otherwise (Intel Arc / Panther Lake B390 / AMD), try Vulkan GPU first!
-    if torch.cuda.is_available():
-        gpu_order = [ti.cuda, ti.vulkan, ti.opengl, ti.cpu]
-    else:
-        gpu_order = [ti.vulkan, ti.opengl, ti.cuda, ti.cpu]
-        
-    for arch in gpu_order:
-        if arch not in candidates:
-            candidates.append(arch)
-            
-    for arch in candidates:
-        try:
-            if arch == ti.cuda:
-                # Taichi only holds small buffers here (particle state lives in torch), so a fixed 0.5 GB pool
-                # instead of 15% of VRAM gives torch 1-3 GB back on CUDA cards (AUDIT §8 F41)
-                ti.init(arch=arch, device_memory_GB=0.5)
-            else:
-                ti.init(arch=arch)
-            
-            actual_arch = ti.lang.impl.current_cfg().arch
-            # Taichi internally falls back to CPU (x64) without raising an exception if CUDA driver is missing
-            if arch != ti.cpu and actual_arch == ti.cpu:
-                print(f"[Taichi] Requested {arch} but driver fell back to CPU. Trying next backend...")
-                ti.reset()
-                continue
-                
-            print(f"[Taichi] Successfully initialized GPU backend: {actual_arch}")
-            return actual_arch
-        except Exception as e:
-            print(f"[Taichi] Failed to initialize {arch}: {e}")
-            continue
-            
-    raise RuntimeError("[Taichi] Failed to initialize any backend")
+from particle_mesh.runtime import bootstrap
 
+bootstrap.configure_torch_env()
+# Taichi is initialised when this module is imported (tests and tools rely on `import main` doing it).
+_init_taichi = bootstrap.init_taichi
 _init_taichi()
 
 from particle_mesh.render.themes import THEMES
@@ -139,20 +86,7 @@ def main():
     engine = SimulationEngine(initial_particles=initial_particles)
     engine.solver_type = SOLVER_MODE
 
-    print("=" * 65)
-    print("                    HARDWARE & COMPUTE STATUS                     ")
-    print("=" * 65)
-    print(f"  Taichi Backend:   {ti.lang.impl.current_cfg().arch} (GPU Accelerated)")
-    print(f"  PyTorch Device:   {engine.device}")
-    print(f"  PyTorch Version:  {torch.__version__}")
-    xpu_ok = hasattr(torch, "xpu") and torch.xpu.is_available()
-    print(f"  Intel XPU Active: {xpu_ok}")
-    print(f"  Particle Kernels: {engine.kernels.name}")
-    if not xpu_ok and engine.device.type == "cpu":
-        print("  [NOTE] PyTorch is performing FFTs on CPU cores.")
-        print(f"         Grid size: {CONFIG['simulation'].get('PHYSICS_GRID_W', 7680)}x{CONFIG['simulation'].get('PHYSICS_GRID_H', 7680)} cells.")
-        print("         Consider reducing PHYSICS_GRID_W/H to 1024 or 2048 if CPU usage is too high.")
-    print("=" * 65)
+    bootstrap.print_status(engine)
     
     # Pre-calculate active potentials
     engine.precompute_kernel()

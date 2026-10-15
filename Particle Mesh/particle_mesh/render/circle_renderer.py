@@ -2,7 +2,7 @@ import taichi as ti
 import torch
 
 from particle_mesh.settings import CONFIG
-from particle_mesh.kernels import to_taichi
+from particle_mesh.runtime.device import to_taichi
 
 # Only N-body mode draws circles, and it is capped at NBODY_MAX_PARTICLES, so size the buffers to that
 MAX_RENDER_PARTICLES = min(290000, CONFIG["simulation"].get("NBODY_MAX_PARTICLES", 10000))
