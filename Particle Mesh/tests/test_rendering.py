@@ -18,7 +18,8 @@ def test_splat_colormap_and_overlay_reach_the_frame(make_engine, headless_canvas
     wy = cam_y + (gy + 0.5) * MR.RENDER_CELL_SIZE
     eng.pos[:500] = torch.tensor([wx, wy])
     eng.num_active = 500
-    thumb = torch.full((50, 60), 200, dtype=torch.uint8, device=eng.device)
+    # Overlays are packed RGBA8 int32 in [x, y] layout: 60 wide, 50 tall, grey 200
+    thumb = MR._pack_gray(torch.full((60, 50), 200, dtype=torch.uint8, device=eng.device))
     renderer.render(canvas, eng.pos, eng.num_active, cam_x, cam_y, 1.0, red, 0.0, 3.0, 0.01, overlay=(thumb, 60, 50))
     img = window.get_image_buffer_as_numpy()                     # [x, y, rgba], y = 0 at the bottom
     assert img[gx, gy, 0] > 0.9 and img[gx, gy, 1] < 0.1        # clump drawn at its render cell
@@ -42,8 +43,8 @@ def test_view_grid_aligns_with_particle_view(make_engine, zoom, frac):
 
     pos = torch.tensor([[mx, my]], device=eng.device).repeat(500, 1)
     counts = eng.kernels.splat_view(pos, 500, cam.cam_x, cam.cam_y, cam.zoom, MR.VIEW_W, MR.VIEW_H, rcs)
-    pidx = int(torch.argmax(counts))
-    particle_cell = (pidx % MR.VIEW_W, pidx // MR.VIEW_W)
+    pidx = int(torch.argmax(counts))                           # counts are (VIEW_W, VIEW_H), x-major
+    particle_cell = (pidx // MR.VIEW_H, pidx % MR.VIEW_H)
     expected = (int(((mx - cam.cam_x) * cam.zoom) // rcs), int(((my - cam.cam_y) * cam.zoom) // rcs))
     assert particle_cell == expected
 
@@ -67,6 +68,6 @@ def test_fft_thumbnail_is_antialiased(make_engine):
     checker = ((ii + jj) % 2).to(torch.complex64)
     mask = torch.ones((h, w), device=eng.device)
     thumb, tw, th = renderer.fft_thumbnail(checker, mask, 100)
-    assert (tw, th) == (100, 100)
-    t = thumb.float()
+    assert (tw, th) == (100, 100) and thumb.shape == (100, 100)
+    t = (thumb & 0xFF).float()                                   # grey level from the packed RGBA8 word
     assert float(t.std()) < 0.05 * float(t.mean())          # uniform after proper averaging

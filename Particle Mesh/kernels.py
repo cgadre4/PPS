@@ -7,7 +7,8 @@ Both backends expose the same methods, used by the PM solver, the engine and the
     gather_integrate(stencil, pos, vel, mass, n, fx, fy, cell_size, dt, damping, use_charge,
                      periodic, universe_w, universe_h, accel_x=None, accel_y=None)
     wrap(pos, n, universe_w, universe_h)
-    splat_view(pos, n, cam_x, cam_y, zoom, view_w, view_h, render_cell_size) -> float (view_h, view_w) tensor
+    splat_view(pos, n, cam_x, cam_y, zoom, view_w, view_h, render_cell_size) -> integer counts (view_w, view_h),
+                                                                                x-major (GGUI [x, y] layout)
 
 "taichi": Taichi kernels on shared memory (torch CUDA + Taichi CUDA, or torch CPU + Taichi CPU). Fastest there.
 "torch":  pure PyTorch on the torch device. Used for Intel XPU, where Taichi (Vulkan) cannot see torch memory.
@@ -109,7 +110,7 @@ class TaichiBackend:
         KT.wrap_positions(pos, n, universe_w, universe_h)
 
     def splat_view(self, pos, n, cam_x, cam_y, zoom, view_w, view_h, render_cell_size):
-        out = torch.zeros((view_h, view_w), device=pos.device, dtype=torch.float32)
+        out = torch.zeros((view_w, view_h), device=pos.device, dtype=torch.int32)
         if n > 0:
             KTI.splat_view_kernel(pos, out, n, float(cam_x), float(cam_y), float(zoom / render_cell_size),
                                   view_w, view_h)

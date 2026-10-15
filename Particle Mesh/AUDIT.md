@@ -324,3 +324,38 @@ Everything still open after PRs #1–#6, in the order it's being done. Option B 
 | 4 | Six hand-rolled `prev_*` key edge-trigger flags in `main.py` | §4 | Done (PR #7) |
 | 5 | Taichi fields allocated at import, forcing `ti.init()` before imports | §4 | Done (PR #7) |
 | 6 | **Option B: fused Triton / `torch.compile` particle kernels** (item 11's remaining part) | 5.4, 3.2 | Deferred: needs Visual Studio 2022 Build Tools |
+
+---
+
+## 8. Performance opportunities (2026-10-15 sweep)
+
+A read-only multi-agent sweep produced these findings. Each one was then checked by a correctness reviewer and a performance reviewer, against the measured profile and the installed torch 2.14.1+xpu / Taichi 1.7.4 source. Gains are the reviewers' estimates unless a measurement is given. Triton and `torch.compile` were out of scope (that's §7 item 6).
+
+| ID | Change | Area | Estimated / measured gain | Status |
+|---|---|---|---|---|
+| F01 | Present frames as packed RGBA8 straight to GGUI (no `from_torch`, no to_rgba8) | render | **Render at 1M measured 6.6–8.2 → 3.1–3.2 ms** (with F09–F11) | Done (PR #8) |
+| F09 | Count-indexed colour LUT (one clamp + one gather) | render | ~0.5 ms | Done (PR #8) |
+| F10 | Leaner splat: border-ring clamp, x-major output, no bool masks | render | ~0.2–0.3 ms at 1M | Done (PR #8) |
+| F11 | Minimap: skip identity band-pass, refresh every `minimap_interval` frames | render | ~0.3–0.8 ms | Done (PR #8) |
+| F20 | Force arrows: sample forces only at arrow centres | render | **Arrow view at 1M measured 15.6 → 9.9 ms render** | Done (PR #8) |
+| F21 | Potential/bandpass views: abs after sampling, identity band-pass = density grid, cached view grid | render | 0.1–1.8 ms in those views | Done (PR #8) |
+| F07 | Cache per-step constant tensors (no H2D copy and sync); in-place wrap | step | ~0.2–0.4 ms | Done (PR #8) |
+| F48 | `tools/bench_frame.py` times the real `render_pm` frame (minimap), plus `--zoom` and `--field` | tooling | measurement | Done (PR #8) |
+| F03 | Periodic force differences by slicing into persistent buffers (no `torch.roll`) | field | ~1.3–2.2 ms/step | Planned (perf PR 2) |
+| F02 | Fused `grid_sample` gather + `grid_sampler_2d_backward` deposit instead of the hand-built stencil (F05 int32 stencil as fallback) | step | ~2–4.5 ms at 1M, 8–12 ms at 4M | Planned (perf PR 2) |
+| F12 | Skip the mass cast/multiply when every mass is 1 | step | ~0.15–0.3 ms at 1M | Planned (perf PR 2) |
+| F04 | Reuse the step's field for spawn orbit speeds (no second solve) | spawn | ~9–20 ms per painting frame | Planned (perf PR 2) |
+| F13 | Cheaper periodic sort (smaller keys, permute into swap buffers) | sort | sort hitch ~35 → ~20 ms at 4M | Planned (perf PR 2) |
+| F22 | Leaner pressure path (slice gradients, no pow at γ = 1, fused scales) | field | ~2–3.5 ms when pressure is on | Planned (perf PR 2) |
+| F24 | Version-counter cache key for `K_eff` (the `id()` key can collide); `irfft2(norm='forward')` A/B | field | correctness; 0–0.3 ms | Planned (perf PR 2) |
+| F27 | Fold uniform gravity (and reflective walls) into the integrate pass | step | 0.5–4 ms in those modes | Planned (perf PR 2) |
+| F32 | Opt-in multi-rate field update (`FIELD_INTERVAL`, default 1) | field | ~3 ms average at k = 2 if enabled | Planned (perf PR 2) |
+| F41 | CUDA: smaller Taichi memory pool (`device_memory_GB`) | capacity | gives torch 1.5–3 GB back on CUDA | Planned (perf PR 2) |
+| F36 | N-body: one fused Taichi kernel (zero-copy on CUDA, tiny CPU hop on Vulkan) | N-body | 7–30× at 10k; cap could rise to ~25–40k | Planned (perf PR 3) |
+| F33/F34 | N-body torch path: fewer passes per tile, symmetric tile pairs | N-body | ~1.5–2.5× | Planned (perf PR 3) |
+| F19, R4.1 | Opt-in config tradeoffs: 2048×1280 grid, `RENDER_CELL_SIZE` 3 | config | ~1.5–2.7 ms each | Documented option |
+| F05 | int32 stencil | step | ~1–1.6 ms at 1M | Fallback for F02 |
+| F06, F08, F17, F18, F28, F35, F47 | Single force buffer, pipelined present, direct ring VBO, render from density grid, fixed-size splat scatter, far-pair culling, Taichi colour expansion | various | ≤0.5 ms each, or scenario-dependent | Not pursued (uncertain or small) |
+| F14–F16, F25, F26, F29–F31, F37–F40, F42–F46, F49, F50, R1–R6 | Time-based or rolling sorts, erase fast path, batched iFFTs, real LJ kernels, `inference_mode`, ImGui trims, XPUGraphs, circle VBO, cap/workspace/chunking changes, CUDA texture present, Taichi fusions and atomics, spectral forces, NGP, a Vulkan particle backend, frame pacing | various | refuted: negligible, slower, or infeasible | Rejected |
+
+The critic's main idea, moving particles into Taichi Vulkan ndarrays on the laptop, was rejected. Each step would hand 2 × 16 MB grids across through the host, costing ~12–18 ms per step (§5.3), which outweighs the 4–6× faster particle kernels at the default 1M particles.

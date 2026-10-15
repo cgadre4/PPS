@@ -52,7 +52,8 @@ uv run python main.py
 
 Taichi 1.7.4 has no XPU backend. On Vulkan it copies every non-CPU tensor argument to the host before a kernel and back again after (`taichi/lang/kernel_impl.py`). Measured on the B390, 1M-particle physics took 115 ms per step that way, against 11.5 ms with the torch backend.
 - Particle hot paths go through `engine.kernels`.
-- Data destined for a Taichi field goes through `kernels.to_taichi(tensor)` then `field.from_torch(...)`. That makes one explicit host copy only when memory isn't shared.
+- Data destined for a Taichi field (arrow and circle vertex buffers) goes through `kernels.to_taichi(tensor)` then `field.from_torch(...)`. That makes one explicit host copy only when memory isn't shared.
+- PM frames don't go through a Taichi field at all. They're copied once into a persistent pinned uint32 host buffer and handed to GGUI as a host-mapped image (`MeshRenderer._present`).
 
 ### Measured performance (Arc B390, torch backend, 2048² grid, 2880×1800 window, `RENDER_CELL_SIZE` 2)
 
@@ -66,13 +67,13 @@ The ranges are thermal and power state. The same commit measured ~15 ms at 1M on
 
 Where the time goes at 1M:
 - **Step:** FFT and forces ~6.6 ms; building the CIC stencil ~3.4 ms; gather ~2.3 ms; deposit ~1 ms.
-- **Render:** Taichi's `set_image` RGBA8 copy ~2.8 ms; colormap; host upload.
+- **Render:** ~3.1–3.2 ms at 1M since the packed-RGBA8 present (was 6.6–8.2 ms): splat, count-LUT colour, one 5.2 MB readback, GGUI upload.
 
 The next speed-up is fused Triton kernels / `torch.compile` (`AUDIT.md` §5.4 option B). That needs MSVC Build Tools; then set `TORCH_COMPILE: true`. Without a compiler it prints one notice and stays eager.
 
 ## Configuration (`config.json`)
 
-- `display`: window size, FPS cap, arrow-overlay styling, `ui_width` (panel width as a fraction of the window).
+- `display`: window size, FPS cap, arrow-overlay styling, `ui_width` (panel width as a fraction of the window), `minimap_interval` (refresh the FFT minimap every N frames; default 4).
 - `simulation`:
   - `SOLVER` (`"pm"` or `"nbody"`; chosen at startup only, there is no runtime switch).
   - `TAICHI_BACKEND`, `KERNEL_BACKEND` (`"auto"`/`"torch"`/`"taichi"`), `TORCH_COMPILE`.
@@ -141,7 +142,7 @@ Frame loop (`main.py`): input handling -> brush spawn/erase -> `engine.step(dt)`
 ### Array layout conventions
 
 - PyTorch grids (`density_grid`, `phi`, `fx`, `fy`, `k_sq`, viewport density) are `[row=y, col=x]`; flat index `j * W + i`.
-- Taichi fields (`MeshRenderer.display_pixels`) are `[x, y]`; `MeshRenderer._present` transposes the `(VIEW_H, VIEW_W, 3)` image before `from_torch`. Row 0 is the bottom of the screen.
+- Presented frames are `(VIEW_W, VIEW_H)` packed RGBA8 int32 (R in the low byte, alpha 255) in GGUI's `[x, y]` layout, with y = 0 at the bottom. `splat_view` returns counts already in that x-major layout. The potential and bandpass views come from `grid_sample` as `(VIEW_H, VIEW_W)` and are coloured through a transposed view.
 - World coordinates span `[0, PHYSICS_GRID_W * PHYSICS_CELL_SIZE)`. `camera.py` maps screen pixels to world via `cam_x/cam_y` (world-space bottom-left of the view) and `zoom`. Advanced PM views resample grids into the viewport with `grid_sample`, using normalised `[-1, 1]` coordinates from `mesh_renderer.build_view_grid()`.
 - The viewport is measured in **render cells** (`RENDER_CELL_SIZE` screen pixels each; `VIEW_W = WIDTH / RENDER_CELL_SIZE`), not pixels.
   - Any code that maps a render-cell index to world coordinates must multiply by `RENDER_CELL_SIZE` before dividing by `zoom`.
@@ -152,10 +153,13 @@ Frame loop (`main.py`): input handling -> brush spawn/erase -> `engine.step(dt)`
 
 All image math runs in PyTorch on the simulation device; Taichi only receives finished buffers.
 - **PM frame entry point:** `MeshRenderer.render_pm(canvas, engine, camera, color_map, ui_w)` draws the density, potential or bandpass view, the FFT minimap (`fft_thumbnail`, mask from the cached `bandpass_mask`) and the force arrows. `build_view_grid` lives in `mesh_renderer.py`, and `main.py` re-exports it.
-- **PM mode:** `MeshRenderer.render` calls `kernels.splat_view` (counts per render cell), then `colorize` (log10 through a cached 257-entry uint8 LUT per theme; empty cells black), then `_present`.
-  - `_present` pastes the overlay, then does one upload into `display_pixels`, then `canvas.set_image`.
+- **PM mode:** `MeshRenderer.render` calls `kernels.splat_view` (integer counts per render cell, x-major). It then colours through a **count-indexed LUT**: count c maps through the same log10 curve, saturating at the count where the curve hits 1, so it's one clamp plus one gather. Last comes `_present`.
+  - The float views (potential, bandpass) use `colorize`: log10 through a cached 257-entry packed LUT; empty cells black.
+  - `_present` pastes the overlay, copies the frame into the pinned host buffer, then calls the PyCanvas `set_image(host_info)`. That is what Taichi's own `Canvas.set_image` does after its to_rgba8 conversion, minus that conversion and the `from_torch` upload. A public-API fallback covers the case where the PyCanvas attribute disappears.
+  - The minimap is cached and refreshed every `minimap_interval` frames. An identity band-pass skips the multiply (`bandpass_mask` returns `None`). The view grid is cached while the camera is still.
   - The potential, bandpass and vector-field views are fed by grid-sampled solver arrays instead.
-- **Overlays** must be pasted before `canvas.set_image()`, because it snapshots the field immediately. The FFT minimap is passed as `overlay=`.
+- **Overlays** are packed RGBA8 in `[x, y]` layout and must be pasted into the frame before `_present` hands it to GGUI. The FFT minimap is passed as `overlay=`.
+- **Force arrows** sample the force grids only at the arrow centres.
 - **Vector arrows** are built as vertex/colour tensors in `MeshRenderer.render_vectors` and uploaded into `vector_verts`/`vector_colors`.
 - **N-body mode:** `CircleRenderer` normalises on-screen particles on the device and uploads them into buffers sized `min(290000, NBODY_MAX_PARTICLES)`.
 - Colour themes (`colors.py`) must have exactly **9** RGB entries in 0-255; the gradient interpolates between indices 0-8.
