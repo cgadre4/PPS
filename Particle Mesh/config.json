@@ -13,6 +13,7 @@
   },
   "simulation": {
     "MAX_PARTICLES": 1000000,
+    "NBODY_MAX_PARTICLES": 10000,
     "PHYSICS_GRID_W": 1440,
     "PHYSICS_GRID_H": 1440,
     "PHYSICS_CELL_SIZE": 2.0,

@@ -154,9 +154,10 @@ class MeshRenderer:
     def __init__(self):
         pass
 
-    def render(self, canvas, pos_tensor, num_active, cam_x, cam_y, zoom, color_map_tensor, min_log, max_log, zoom_intensity_scale):
+    def render(self, canvas, pos_tensor, num_active, cam_x, cam_y, zoom, color_map_tensor, min_log, max_log, zoom_intensity_scale, overlay=None):
         """
         Runs density scatter onto the mesh grid and maps values to colormaps, drawing an image texture.
+        overlay: optional (thumb_tensor, thumb_w, thumb_h) grayscale image drawn in the bottom-left corner.
         """
         clear_visual_density()
         
@@ -174,21 +175,28 @@ class MeshRenderer:
             
         scale = float(max(1.0, zoom) ** zoom_intensity_scale)
         render_color_kernel(color_map_tensor, float(min_log), float(max_log), scale)
+        self._draw_overlay(overlay)
         canvas.set_image(display_pixels)
 
-    def render_grid(self, canvas, view_dens_tensor, color_map_tensor, min_log, max_log, scale):
+    def render_grid(self, canvas, view_dens_tensor, color_map_tensor, min_log, max_log, scale, overlay=None):
         """
         Renders a grid-sampled potential or bandpass density map directly.
+        overlay: optional (thumb_tensor, thumb_w, thumb_h) grayscale image drawn in the bottom-left corner.
         """
         visual_density.from_torch(view_dens_tensor.transpose(0, 1).contiguous())
         render_color_kernel(color_map_tensor, float(min_log), float(max_log), float(scale))
+        self._draw_overlay(overlay)
         canvas.set_image(display_pixels)
 
-    def overlay_fft(self, fft_thumb_tensor, offset_x, offset_y, thumb_w, thumb_h):
+    def _draw_overlay(self, overlay):
         """
-        Overlays the grayscale FFT thumbnail in the viewport corner.
+        Writes the grayscale thumbnail into display_pixels. This must run BEFORE canvas.set_image(), which
+        snapshots the field immediately; writes made after it are lost when the next frame repaints.
         """
-        overlay_fft_kernel(fft_thumb_tensor, offset_x, offset_y, thumb_w, thumb_h)
+        if overlay is None:
+            return
+        thumb_tensor, thumb_w, thumb_h = overlay
+        overlay_fft_kernel(thumb_tensor, 0, 0, thumb_w, thumb_h)
 
     def render_vectors(self, canvas, view_fx, view_fy, color_map_tensor, min_log, max_log, length_scale, head_size, head_angle, width):
         """

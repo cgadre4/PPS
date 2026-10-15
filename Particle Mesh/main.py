@@ -69,7 +69,7 @@ def _init_taichi():
 _init_taichi()
 
 from colors import THEMES
-from engine import SimulationEngine
+from engine import SimulationEngine, NBODY_MAX_PARTICLES
 from camera import SimulationCamera
 from circle_renderer import CircleRenderer
 from mesh_renderer import MeshRenderer
@@ -105,10 +105,10 @@ def main():
 
     # Determine safe startup active particle count from configuration
     initial_particles = CONFIG["simulation"].get("initial_particles", 1000000)
-    if SOLVER_MODE == 'nbody' and initial_particles > 20000:
+    if SOLVER_MODE == 'nbody' and initial_particles > NBODY_MAX_PARTICLES:
         print(f"[Warning] initial_particles ({initial_particles}) is extremely high for O(N^2) Direct N-Body mode.")
-        print("          Automatically capping to 10,000 to prevent system hang. Lower it in config.json if desired.")
-        initial_particles = 10000
+        print(f"          Capping to NBODY_MAX_PARTICLES ({NBODY_MAX_PARTICLES}) to prevent a hang or out-of-memory error.")
+        initial_particles = NBODY_MAX_PARTICLES
     
     # Initialize state engine and override solver mode from configuration
     engine = SimulationEngine(initial_particles=initial_particles)
@@ -334,11 +334,46 @@ def main():
                     color_tensor,
                     engine.num_active,
                     camera.cam_x, camera.cam_y,
-                    camera.width, camera.height,
+                    camera.width / camera.zoom, camera.height / camera.zoom, # Visible world extent
                     0.0005 # Visual radius
                 )
                 
             elif engine.solver_type == 'pm':
+                # FFT PIP radar thumbnail. It is handed to the renderer, which draws it before canvas.set_image()
+                # (set_image snapshots the frame immediately, so drawing it afterwards would never show).
+                fft_overlay = None
+                if engine.show_fft:
+                    rho_k = torch.fft.rfft2(engine.pm_solver.density_grid)
+                    k_sq_real = engine.pm_solver.k_sq[:, :rho_k.shape[1]]
+                    k_mag = torch.sqrt(k_sq_real)
+
+                    bp_trans = max(engine.bp_transition, 0.001)
+                    bandpass = torch.ones_like(k_mag)
+                    if engine.bp_inner > 0.01:
+                        bandpass *= torch.sigmoid((k_mag - engine.bp_inner) / bp_trans * 4.0)
+                    if engine.bp_outer < 4.99:
+                        bandpass *= torch.sigmoid((engine.bp_outer - k_mag) / bp_trans * 4.0)
+
+                    mag = torch.abs(rho_k) * bandpass
+                    mag_4d = mag.unsqueeze(0).unsqueeze(0)
+
+                    # Size in render cells (display_pixels resolution); on screen it spans ui_w of the window width
+                    minimap_w = int(camera.width * sim_gui.ui_w / CONFIG["simulation"]["RENDER_CELL_SIZE"])
+                    minimap_h = minimap_w
+
+                    thumb_half = torch.nn.functional.interpolate(
+                        mag_4d, size=(minimap_h, minimap_w // 2), mode='bilinear', align_corners=False
+                    ).squeeze(0).squeeze(0)
+
+                    thumb_half = torch.log1p(thumb_half)
+                    thumb_half = torch.fft.fftshift(thumb_half, dim=0)
+                    # Real input: |F(-kx, -ky)| = |F(kx, ky)|, so the negative-kx half is a point reflection
+                    thumb_full = torch.cat([torch.flip(thumb_half, dims=[0, 1]), thumb_half], dim=1)
+
+                    thumb_max = thumb_full.max() + 1e-5
+                    fft_thumb = (thumb_full / thumb_max * 255.0).to(torch.uint8)
+                    fft_overlay = (fft_thumb.contiguous(), thumb_full.shape[1], minimap_h)
+
                 # Perform grid sampling on GPU before rendering advanced views
                 if engine.show_potential or engine.use_bandpass_render or engine.show_field:
                     grid_w = int(camera.width / CONFIG["simulation"]["RENDER_CELL_SIZE"])
@@ -364,8 +399,9 @@ def main():
                     view_dens = torch.clamp(view_dens, min=0.0)
                     
                     mesh_renderer.render_grid(
-                        canvas, view_dens, active_map, 
-                        engine.pot_min_log, engine.pot_max_log, 1.0
+                        canvas, view_dens, active_map,
+                        engine.pot_min_log, engine.pot_max_log, 1.0,
+                        overlay=fft_overlay
                     )
                 elif engine.use_bandpass_render:
                     # Filter densities on the fly
@@ -391,7 +427,8 @@ def main():
                     
                     mesh_renderer.render_grid(
                         canvas, view_dens, active_map,
-                        CONFIG["simulation"]["MIN_LOG_DENSITY"], CONFIG["simulation"]["MAX_LOG_DENSITY"], 1.0
+                        CONFIG["simulation"]["MIN_LOG_DENSITY"], CONFIG["simulation"]["MAX_LOG_DENSITY"], 1.0,
+                        overlay=fft_overlay
                     )
                 else:
                     mesh_renderer.render(
@@ -403,7 +440,8 @@ def main():
                         active_map,
                         CONFIG["simulation"]["MIN_LOG_DENSITY"],
                         CONFIG["simulation"]["MAX_LOG_DENSITY"],
-                        CONFIG["simulation"]["ZOOM_INTENSITY_SCALE"]
+                        CONFIG["simulation"]["ZOOM_INTENSITY_SCALE"],
+                        overlay=fft_overlay
                     )
 
                 # Overlay vector field
@@ -421,38 +459,6 @@ def main():
                         CONFIG["display"].get("arrow_head_angle", 0.5),
                         CONFIG["display"].get("arrow_width", 0.001)
                     )
-
-                # Overlay FFT PIP radar
-                if engine.show_fft:
-                    rho_k = torch.fft.rfft2(engine.pm_solver.density_grid)
-                    k_sq_real = engine.pm_solver.k_sq[:, :rho_k.shape[1]]
-                    k_mag = torch.sqrt(k_sq_real)
-                    
-                    bp_trans = max(engine.bp_transition, 0.001)
-                    bandpass = torch.ones_like(k_mag)
-                    if engine.bp_inner > 0.01:
-                        bandpass *= torch.sigmoid((k_mag - engine.bp_inner) / bp_trans * 4.0)
-                    if engine.bp_outer < 4.99:
-                        bandpass *= torch.sigmoid((engine.bp_outer - k_mag) / bp_trans * 4.0)
-                        
-                    mag = torch.abs(rho_k) * bandpass
-                    mag_4d = mag.unsqueeze(0).unsqueeze(0)
-                    
-                    minimap_w = int(camera.width * sim_gui.ui_w)
-                    minimap_h = int(camera.width * sim_gui.ui_w)
-                    
-                    thumb_half = torch.nn.functional.interpolate(
-                        mag_4d, size=(minimap_h, minimap_w // 2), mode='bilinear', align_corners=False
-                    ).squeeze(0).squeeze(0)
-                    
-                    thumb_half = torch.log1p(thumb_half)
-                    thumb_half = torch.fft.fftshift(thumb_half, dim=0)
-                    thumb_full = torch.cat([torch.flip(thumb_half, dims=[1]), thumb_half], dim=1)
-                    
-                    thumb_max = thumb_full.max() + 1e-5
-                    fft_thumb = (thumb_full / thumb_max * 255.0).to(torch.uint8)
-                    
-                    mesh_renderer.overlay_fft(fft_thumb.contiguous(), 0, 0, minimap_w, minimap_h)
 
         # Draw brush ring overlay
         update_brush_ring(mouse_norm[0], mouse_norm[1], interaction_radius / float(WIDTH), interaction_radius / float(HEIGHT))

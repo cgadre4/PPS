@@ -21,7 +21,7 @@ uv run python main.py
   - Taichi arch: CUDA first if torch sees CUDA, otherwise Vulkan → OpenGL → CUDA → CPU (`main._init_taichi`). Override with `simulation.TAICHI_BACKEND` in `config.json`.
   - A hardware/compute status banner is printed at startup.
 - There is no build step, test suite or linter. Verify changes by running the app.
-- In `nbody` mode `main.py` caps startup particles at 10,000 because the solver is O(N^2).
+- In `nbody` mode, `simulation.NBODY_MAX_PARTICLES` (default 10,000) caps both the startup count and brush/image spawning (`SimulationEngine.capacity()`), because the solver builds dense N×N tensors (~4 GB at 10k).
 
 ### Known XPU limitation
 
@@ -30,7 +30,7 @@ On Intel GPUs torch runs on `xpu` while Taichi runs on Vulkan. Taichi 1.7.4 cann
 ## Configuration (`config.json`)
 
 - `display`: window size, FPS cap, arrow-overlay styling, `ui_width` (panel width as a fraction of the window).
-- `simulation`: `SOLVER` (`"pm"` or `"nbody"`; chosen at startup only, there is no runtime switch), optional `TAICHI_BACKEND`, grid size, `PHYSICS_CELL_SIZE`, `RENDER_CELL_SIZE`, particle limits, log-density colour range. The checked-in values are sized for the laptop's Arc iGPU (1440² grid, 1M max particles, `RENDER_CELL_SIZE` 2).
+- `simulation`: `SOLVER` (`"pm"` or `"nbody"`; chosen at startup only, there is no runtime switch), optional `TAICHI_BACKEND`, `NBODY_MAX_PARTICLES`, grid size, `PHYSICS_CELL_SIZE`, `RENDER_CELL_SIZE`, particle limits, log-density colour range. The checked-in values are sized for the laptop's Arc iGPU (1440² grid, 1M max particles, `RENDER_CELL_SIZE` 2).
 - `sliders`: every entry is `[min, max, default]`. `engine.py` reads index `[2]` for defaults; `gui.py` reads `[0]`/`[1]` for slider bounds. A new tunable parameter should follow this convention.
 
 ## Architecture
@@ -38,12 +38,13 @@ On Intel GPUs torch runs on `xpu` while Taichi runs on Vulkan. Taichi 1.7.4 cann
 Frame loop (`main.py`): input handling -> brush spawn/erase -> `engine.step(dt)` -> render (PM density mesh or N-body circles, plus optional overlays) -> ImGui panel -> `window.show()` -> FPS throttle. `dt = (1/FPS_TARGET) * 10**time_scale_log`.
 
 - **`engine.py` `SimulationEngine`** is the single source of state: preallocated `pos`/`vel` (`MAX_PARTICLES x 2`, float32) and `masses` (int8), with `num_active` marking the live prefix. Particles are always kept compacted at the front; spawn appends, and deletion (brush or leaving the universe in `wrap_delete` mode) re-packs survivors via boolean masks. Every per-particle op must slice `[:num_active]`. The GUI and `main.py` mutate engine attributes directly; there is no setter layer.
-- **`masses` doubles as charge.** It is 1 for every particle except in Coulomb mode, where the GUI randomises it to +/-1. Switching potential resets it.
+- **`masses` doubles as charge.** It is 1 for every particle except in Coulomb mode, where the GUI randomises it to +/-1 and new spawns get random +/-1 (`SimulationEngine._new_masses`). Switching potential resets it. In Coulomb mode the PM gather kernel scales each particle's force by its own charge (`use_charge`).
+- **Friction** is applied as `exp(-friction * dt)`, computed on the host, so it can never flip a velocity's sign.
 - **PM solver (`pm_solver.py`)**, per step: CIC-scatter mass onto `density_grid` (Taichi atomics) -> Poisson solve -> `fx`/`fy` -> optional pressure forces -> Taichi kernel gathers forces back with CIC weights and does a semi-implicit Euler update with friction in place.
   - If the torch device is CUDA or XPU, the Poisson solve uses torch FFT: `rfft2` -> multiply by the cached Fourier kernel `K_k` and a Gaussian softening filter -> `irfft2` -> `torch.gradient`.
   - If the torch device is CPU, it falls back to a Taichi red-black Gauss-Seidel solve (`poisson_rbgs_kernel`, 12 sweeps, gravity only, Dirichlet edges). That is far from converged; see `AUDIT.md` §5.2.
   - `phi`, `fx`, `fy` and `density_grid` are kept on the solver and read by the renderer for the potential/field/bandpass/FFT views.
-- **Kernel caching:** `potentials.py` `PotentialsManager.get_fourier_kernel` builds `K_k` (gravity/Coulomb analytically as screened Yukawa `-+G/(k^2 + 1/range^2)`; harmonic/LJ by FFT of a real-space periodic potential on the full grid). The PM solver only rebuilds it when the potential *type* changes. Any change to a kernel parameter (G, force range, spring_k, epsilon, sigma) must call `engine.precompute_kernel()`, as the GUI does for its sliders. Softening is applied per step, not baked into `K_k`.
+- **Kernel caching:** `potentials.py` `PotentialsManager.get_fourier_kernel` builds `K_k` (gravity/Coulomb analytically as screened Yukawa `-+G/(k^2 + 1/range^2)`; harmonic/LJ by FFT of a real-space periodic potential on the full grid). `K_k[0, 0]` is always zeroed, so phi has zero mean; don't remove that, because the mean term destroys float32 precision in phi. The PM solver only rebuilds it when the potential *type* changes. Any change to a kernel parameter (G, force range, spring_k, epsilon, sigma) must call `engine.precompute_kernel()`, as the GUI does for its sliders. Softening is applied per step, not baked into `K_k`.
 - **N-body solver (`nbody_solver.py`)** builds full NxN pairwise matrices in PyTorch and returns accelerations; integration happens in `engine.step`. On a CPU torch device with gravity, it uses a Taichi kernel instead (`nbody_taichi_solve_kernel`; note that kernel uses a 3D `1/r^2` force while the torch path uses 2D `1/r`).
 - **Adding or changing a potential touches four places:** `potentials.get_fourier_kernel` (PM), `nbody_solver.solve` (N-body), `engine.precompute_kernel`/`step` param dicts, and the buttons/sliders in `gui.py`.
 
@@ -60,6 +61,7 @@ Frame loop (`main.py`): input handling -> brush spawn/erase -> `engine.step(dt)`
 ### Rendering
 
 - PM mode: `MeshRenderer` scatters visible particles into a viewport-sized density field and maps `log10` density through a theme colourmap. The potential, bandpass and vector-field views are fed by grid-sampled solver arrays instead.
+- `canvas.set_image()` snapshots `display_pixels` immediately. Anything drawn into the field (such as the FFT minimap, passed as `overlay=`) must be written before `set_image`, or it never appears.
 - N-body mode: `CircleRenderer` copies up to `MAX_RENDER_PARTICLES` (290,000) on-screen particles into Taichi fields for `canvas.circles`.
 - Colour themes (`colors.py`) must have exactly **9** RGB entries in 0-255; kernels interpolate between indices 0-8.
 
