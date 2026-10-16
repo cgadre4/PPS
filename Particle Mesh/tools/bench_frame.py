@@ -8,7 +8,7 @@ packed present), offscreen.
           uv run python tools/bench_frame.py 1e4 2e4 --solver nbody   (direct N-body step + circle render)
           uv run python tools/bench_frame.py 1e6 --app                (whole App.frame: input, step, render, panel)
   --app numbers are for A/B only: offscreen, GGUI work is never presented and the shared GPU stalls (~75 ms/frame at
-  1M on the B390 for master and the refactor alike), so they are far above the real windowed frame time.
+  1M on the B390), an artefact of never calling window.show(). The real windowed App.frame measured ~11 ms at 1M.
 
 Uses the same Taichi/torch/kernel backend selection as the app (runtime.bootstrap). Prints ms per stage.
 Always A/B performance changes back to back (e.g. against a git worktree of master), never against stored numbers.
