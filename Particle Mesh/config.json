@@ -22,8 +22,8 @@
     "FIELD_INTERVAL": 1,
     "PHYSICS_GRID_W": 2048,
     "PHYSICS_GRID_H": 2048,
-    "PHYSICS_CELL_SIZE": 2.0,
-    "RENDER_CELL_SIZE": 2.0,
+    "PHYSICS_CELL_SIZE": 4.0,
+    "RENDER_CELL_SIZE": 1.0,
     "ZOOM_INTENSITY_SCALE": 0.01,
     "MIN_LOG_DENSITY": 0.0,
     "MAX_LOG_DENSITY": 3.0,
@@ -39,7 +39,7 @@
     "gravity_range": [
       1.0,
       8192.0,
-      100.0
+      8192.0
     ],
     "friction": [
       0.0,

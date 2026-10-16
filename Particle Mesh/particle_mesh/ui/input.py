@@ -1,7 +1,7 @@
 """
 Keyboard and mouse handling: edge-detected keys, camera pan/zoom, brush resize, panel toggling, and the brush
-action (spawn / erase) for this frame. (Taichi 1.7 GGUI reports no mouse-wheel events, so zoom and brush size use
-drags and keys.)
+action (spawn / erase) for this frame. Taichi 1.7 GGUI (ti.ui.Window) reports no mouse-wheel events, so zoom is
+Ctrl+left drag (or the up/down arrows) and brush size Ctrl+right drag.
 """
 import math
 from dataclasses import dataclass
@@ -9,8 +9,10 @@ from dataclasses import dataclass
 import taichi as ti
 
 # Every key/button the app reads
-DEFAULT_KEYS = ('z', 'p', 'f', 'r', 'm', ti.ui.SPACE, ti.ui.RIGHT, ti.ui.LEFT, ti.ui.UP, ti.ui.DOWN,
+DEFAULT_KEYS = (ti.ui.CTRL, 'p', 'f', 'r', 'm', ti.ui.SPACE, ti.ui.RIGHT, ti.ui.LEFT, ti.ui.UP, ti.ui.DOWN,
                 ti.ui.LMB, ti.ui.RMB, ti.ui.MMB)
+# Drag sensitivity: zoom / brush radius scale by exp(DRAG_RATE * vertical drag in window heights)
+DRAG_RATE = 5.0
 # Clickable "show panel" arrow in the top-left corner (normalised screen coordinates)
 ARROW_MAX_X = 0.04
 ARROW_MIN_Y = 0.95
@@ -47,7 +49,7 @@ class FrameIntent:
     lmb: bool
     rmb: bool
     hovering_ui: bool
-    modifying_view: bool    # Z, Space or a pan drag is active: the mouse steers the view, not the brush
+    modifying_view: bool    # Ctrl, Space or a pan drag is active: the mouse steers the view, not the brush
     spawn: bool
     erase: bool
     spawn_count: int
@@ -64,8 +66,9 @@ class InputController:
         self.brush_limits = brush_limits
         # Drag tracking states
         self.prev_pan_active = False
-        self.prev_z_lmb = False
-        self.prev_z_rmb = False
+        self.prev_zoom_drag = False
+        self.prev_brush_drag = False
+        self.zoom_anchor = (0.5, 0.5)     # normalised cursor position where the zoom drag started
         self.prev_mouse_norm = (0.0, 0.0)
 
     def process(self, engine, palettes, controls, ui_w):
@@ -75,7 +78,7 @@ class InputController:
 
         # Capture key states
         keys.update()
-        z_pressed = keys.held('z')
+        ctrl_pressed = keys.held(ti.ui.CTRL)
         space_pressed = keys.held(ti.ui.SPACE)
 
         # Keyboard Toggles (Edge-Triggered)
@@ -117,20 +120,23 @@ class InputController:
             camera.pan(dx, dy)
         self.prev_pan_active = pan_active
 
-        # Zoom drag (Z+LMB), relative to the viewport centre
-        z_lmb_active = lmb_pressed and z_pressed
-        if z_lmb_active and self.prev_z_lmb:
+        # Zoom drag (Ctrl+LMB): drag up zooms in, anchored at the point where the drag started
+        zoom_drag = lmb_pressed and ctrl_pressed
+        if zoom_drag and not self.prev_zoom_drag:
+            self.zoom_anchor = mouse_norm
+        elif zoom_drag:
             dy = mouse_norm[1] - self.prev_mouse_norm[1]
-            camera.zoom_around_mouse(width / 2.0, height / 2.0, math.exp(dy * 5.0))
-        self.prev_z_lmb = z_lmb_active
+            camera.zoom_around_mouse(self.zoom_anchor[0] * width, self.zoom_anchor[1] * height,
+                                     math.exp(dy * DRAG_RATE))
+        self.prev_zoom_drag = zoom_drag
 
-        # Brush resize (Z+RMB drag)
-        z_rmb_active = rmb_pressed and z_pressed
-        if z_rmb_active and self.prev_z_rmb:
+        # Brush resize (Ctrl+RMB drag): drag up grows the brush
+        brush_drag = rmb_pressed and ctrl_pressed
+        if brush_drag and self.prev_brush_drag:
             dy = mouse_norm[1] - self.prev_mouse_norm[1]
-            radius = controls.radius * math.exp(dy * 5.0)
+            radius = controls.radius * math.exp(dy * DRAG_RATE)
             controls.radius = max(self.brush_limits[0], min(self.brush_limits[1], radius))
-        self.prev_z_rmb = z_rmb_active
+        self.prev_brush_drag = brush_drag
 
         self.prev_mouse_norm = mouse_norm
 
@@ -144,7 +150,7 @@ class InputController:
         world_x, world_y = camera.screen_to_world(mouse_norm[0] * width, mouse_norm[1] * height)
         world_radius = controls.radius / camera.zoom
 
-        modifying_view = z_pressed or space_pressed or pan_active
+        modifying_view = ctrl_pressed or space_pressed or pan_active
         brush_free = not modifying_view and not hovering_ui
         return FrameIntent(
             mouse_norm=mouse_norm, world_x=world_x, world_y=world_y, world_radius=world_radius,

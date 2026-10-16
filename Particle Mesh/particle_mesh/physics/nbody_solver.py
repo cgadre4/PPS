@@ -84,9 +84,10 @@ class DirectNBodySolver:
                 factor.mul_((spring_k / N) * m[None, :])
             else:  # lennard_jones
                 s6 = (sigma / r) ** 6
-                # Force magnitude F(r) = 24 * eps / r * (2 (sigma/r)^12 - (sigma/r)^6), clamped against spikes
+                # Repulsive force F(r) = -dV/dr = 24 * eps / r * (2 (sigma/r)^12 - (sigma/r)^6), clamped against
+                # spikes. It pushes the target away from the source, i.e. along -diff.
                 force_mag = ((24.0 * epsilon) / r * (2.0 * s6 * s6 - s6)).clamp_(-500000.0, 500000.0)
-                factor.mul_(force_mag).div_(r).mul_(m[None, :])
+                factor.mul_(force_mag).div_(r).mul_(-m[None, :])
 
             ax[i0:i1] = (factor * dx).sum(1)
             ay[i0:i1] = (factor * dy).sum(1)

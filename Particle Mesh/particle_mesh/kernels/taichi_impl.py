@@ -132,8 +132,9 @@ def nbody_accel_kernel(
             else:
                 s = sigma / r
                 s6 = s * s * s * s * s * s
+                # Repulsive -dV/dr (clamped): pushes the target away from the source, along -(dx, dy)
                 force_mag = ti.min(ti.max(24.0 * epsilon / r * (2.0 * s6 * s6 - s6), -500000.0), 500000.0)
-                f = force_mag / r * mj * screen
+                f = -force_mag / r * mj * screen
             ax += f * dx
             ay += f * dy
         if kind == 1:

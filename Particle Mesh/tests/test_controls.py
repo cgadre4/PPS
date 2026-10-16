@@ -113,24 +113,36 @@ def test_pan_drag(rig, pan_keys):
     assert intent.modifying_view and not intent.spawn
 
 
-def test_z_lmb_zoom_about_centre(rig):
+def test_ctrl_lmb_zoom_about_drag_start(rig):
     ref = SimulationCamera(W, H, 8192, 8192)
-    rig.frame(held={'z', ti.ui.LMB}, cursor=(0.3, 0.5))
-    rig.frame(held={'z', ti.ui.LMB}, cursor=(0.3, 0.6))
-    ref.zoom_around_mouse(W / 2.0, H / 2.0, math.exp((0.6 - 0.5) * 5.0))
+    rig.frame(held={ti.ui.CTRL, ti.ui.LMB}, cursor=(0.3, 0.5))       # press latches the anchor
+    intent = rig.frame(held={ti.ui.CTRL, ti.ui.LMB}, cursor=(0.3, 0.6))
+    rig.frame(held={ti.ui.CTRL, ti.ui.LMB}, cursor=(0.35, 0.7))     # anchor stays where the drag started
+    ref.zoom_around_mouse(0.3 * W, 0.5 * H, math.exp((0.6 - 0.5) * 5.0))
+    ref.zoom_around_mouse(0.3 * W, 0.5 * H, math.exp((0.7 - 0.6) * 5.0))
     assert rig.camera.zoom == pytest.approx(ref.zoom)
     assert (rig.camera.cam_x, rig.camera.cam_y) == pytest.approx((ref.cam_x, ref.cam_y))
+    assert intent.modifying_view and not intent.spawn                   # Ctrl+LMB never spawns
 
 
-def test_z_rmb_resizes_brush_with_clamp(rig):
+def test_ctrl_rmb_resizes_brush_with_clamp(rig):
     r0 = rig.controls.radius
-    rig.frame(held={'z', ti.ui.RMB}, cursor=(0.5, 0.5))
-    rig.frame(held={'z', ti.ui.RMB}, cursor=(0.5, 0.55))
+    z0 = rig.camera.zoom
+    rig.frame(held={ti.ui.CTRL, ti.ui.RMB}, cursor=(0.5, 0.5))
+    intent = rig.frame(held={ti.ui.CTRL, ti.ui.RMB}, cursor=(0.5, 0.55))
     assert rig.controls.radius == pytest.approx(min(LIMITS[1], r0 * math.exp(0.05 * 5.0)))
-    rig.frame(held={'z', ti.ui.RMB}, cursor=(0.5, 5.0))
+    assert not intent.erase and rig.camera.zoom == z0                   # Ctrl+RMB never erases or zooms
+    rig.frame(held={ti.ui.CTRL, ti.ui.RMB}, cursor=(0.5, 5.0))
     assert rig.controls.radius == LIMITS[1]
-    rig.frame(held={'z', ti.ui.RMB}, cursor=(0.5, -5.0))
+    rig.frame(held={ti.ui.CTRL, ti.ui.RMB}, cursor=(0.5, -5.0))
     assert rig.controls.radius == LIMITS[0]
+
+
+def test_z_no_longer_steers_the_view(rig):
+    z0, r0 = rig.camera.zoom, rig.controls.radius
+    rig.frame(held={'z', ti.ui.LMB}, cursor=(0.5, 0.5))
+    intent = rig.frame(held={'z', ti.ui.LMB}, cursor=(0.5, 0.6))
+    assert rig.camera.zoom == z0 and rig.controls.radius == r0 and intent.spawn
 
 
 def test_spawn_and_erase_respect_panel(rig):
@@ -143,7 +155,7 @@ def test_spawn_and_erase_respect_panel(rig):
     assert (intent.world_x, intent.world_y) == pytest.approx(rig.camera.screen_to_world(0.5 * W, 0.5 * H))
     intent = rig.frame(held={ti.ui.RMB}, cursor=(0.5, 0.5))
     assert intent.erase and not intent.spawn
-    assert not rig.frame(held={ti.ui.RMB, 'z'}, cursor=(0.5, 0.5)).erase            # Z steers the brush size
+    assert not rig.frame(held={ti.ui.RMB, ti.ui.CTRL}, cursor=(0.5, 0.5)).erase      # Ctrl steers the brush size
 
 
 def test_keyboard_zoom(rig):

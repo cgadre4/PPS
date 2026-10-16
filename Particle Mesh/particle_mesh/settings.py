@@ -21,7 +21,7 @@ MAX_CIRCLE_BUFFER = 290000
 # Shipped [min, max, default] for every slider, used when config.json lacks one
 _SLIDER_DEFAULTS = {
     "gravity": (0.01, 100.0, 0.64),
-    "gravity_range": (1.0, 8192.0, 100.0),
+    "gravity_range": (1.0, 8192.0, 8192.0),     # max = no screening (engine.FORCE_RANGE_OFF)
     "friction": (0.0, 5.0, 0.1),
     "pressure": (0.01, 10000.0, 1.0),
     "softening_length": (0.1, 10.0, 1.5),
@@ -65,8 +65,8 @@ class Settings:
     initial_particles: int = 1000000
     grid_w: int = 2048
     grid_h: int = 2048
-    physics_cell_size: float = 2.0
-    render_cell_size: float = 2.0
+    physics_cell_size: float = 4.0
+    render_cell_size: float = 1.0
     zoom_intensity_scale: float = 0.01
     min_log_density: float = 0.0
     max_log_density: float = 3.0

@@ -125,6 +125,8 @@ class SimulationGUI:
         self.engine.gravity_range = gui.slider_float("Force Range", self.engine.gravity_range, self.config["sliders"]["gravity_range"][0], self.config["sliders"]["gravity_range"][1])
         if old_fr != self.engine.gravity_range:
             self.engine.request_kernel_rebuild()
+        if self.engine.gravity_range >= self.config["sliders"]["gravity_range"][1]:
+            gui.text("Force Range: off (pure 2D law, |a| = G m / r)")
             
         # Gas pressure scaling (PM Mode only)
         if self.engine.solver_type == 'pm':
@@ -133,7 +135,8 @@ class SimulationGUI:
                 self.engine.gamma = gui.slider_float("Poly Index (Gamma)", self.engine.gamma, self.config["sliders"]["polytropic_gamma"][0], self.config["sliders"]["polytropic_gamma"][1])
             
         # Boundary selector
-        bound_text = "SOLID WALL BOUNCE" if self.engine.boundary_mode == 'reflective_walls' else "UNIVERSE WRAPPED"
+        bound_text = {'open': "OPEN (PARTICLES LEAVE)", 'periodic': "UNIVERSE WRAPPED",
+                      'reflective_walls': "SOLID WALL BOUNCE"}[self.engine.boundary_mode]
         if gui.button(f"Boundary: {bound_text}"):
             self.engine.toggle_boundary()
                 
@@ -142,9 +145,12 @@ class SimulationGUI:
         self.engine.friction = self.friction_val
         
         # Force Softening
-        # Softening length in world units: Gaussian filter in PM mode, Plummer epsilon in N-body mode
+        # Softening length in world units: Plummer epsilon (N-body, and the sampled PM kernels), Gaussian filter for
+        # the exact periodic gravity/Coulomb kernel. The sampled kernels depend on it, so changes rebuild them.
         self.softening_val = gui.slider_float("Force Softening Length", self.softening_val, self.config["sliders"]["softening_length"][0], self.config["sliders"]["softening_length"][1])
-        self.engine.softening_length = self.softening_val
+        if self.softening_val != self.engine.softening_length:
+            self.engine.softening_length = self.softening_val
+            self.engine.request_kernel_rebuild()
         
         # Time Scale Log
         controls.log_time = gui.slider_float("Time Scale (Log)", controls.log_time, self.config["sliders"]["time_scale_log"][0], self.config["sliders"]["time_scale_log"][1])
@@ -238,8 +244,8 @@ class SimulationGUI:
         gui.text("--- CONTROL HOTKEYS ---")
         gui.text("LMB: Spawn | RMB: Delete")
         gui.text("Space+LMB / MMB Drag: Pan View")
-        gui.text("Z+LMB Drag or Up/Down: Zoom")
-        gui.text("Z+RMB Drag: Brush Size")
+        gui.text("Ctrl+LMB Drag or Up/Down: Zoom")
+        gui.text("Ctrl+RMB Drag: Brush Size")
         if self.engine.solver_type == 'pm':
             gui.text("P: Toggle Potential View")
             gui.text("F: Toggle Vector Field")

@@ -27,6 +27,12 @@ KERNEL_REBUILD_DELAY = 0.15
 
 POTENTIALS = ('gravity', 'lennard_jones', 'harmonic', 'coulomb')
 PRESSURE_MODELS = ('none', 'isothermal', 'polytropic')
+# 'open': particles that leave the physics mesh are deleted, and forces come from an isolated (zero-padded)
+# field solve with no periodic images. 'periodic': a wrapped torus. 'reflective_walls': bounce at the mesh edge
+# (isolated solve). toggle_boundary() cycles in this order.
+BOUNDARY_MODES = ('open', 'periodic', 'reflective_walls')
+# The force-range slider's maximum means "no screening": the pure 2D law |a| = G * m / r
+FORCE_RANGE_OFF = SETTINGS.slider("gravity_range")[1]
 
 UNIVERSE_W = SETTINGS.universe_w
 UNIVERSE_H = SETTINGS.universe_h
@@ -55,7 +61,7 @@ class SimulationEngine:
         self.solver_type = (solver or SETTINGS.solver).lower()
         self.potential_type = 'gravity' # 'gravity', 'lennard_jones', 'harmonic'
         self.pressure_model = 'none' # 'none', 'isothermal', 'polytropic'
-        self.boundary_mode = 'periodic' # 'periodic' (wrap around, matches the FFT solver), 'reflective_walls'
+        self.boundary_mode = 'open'  # see BOUNDARY_MODES
         
         # Physics Parameters
         self.G = SETTINGS.slider("gravity")[2]
@@ -179,7 +185,7 @@ class SimulationEngine:
         """
         self._kernel_dirty_since = None
         self._field_dirty = True
-        self.pm_solver.update_kernel(self.potential_type, self._physics_params())
+        self.pm_solver.update_kernel(self.potential_type, self._physics_params(), isolated=not self.periodic)
 
     # ------------------------------------------------------------------ commands (called by the GUI panel)
 
@@ -198,8 +204,29 @@ class SimulationEngine:
         self.pressure_model = model
 
     def toggle_boundary(self):
-        """Switch between the periodic (wrapped) universe and reflective walls."""
-        self.boundary_mode = 'periodic' if self.boundary_mode == 'reflective_walls' else 'reflective_walls'
+        """Cycle open -> periodic (wrapped) -> reflective walls. The PM kernel follows on the next solve."""
+        i = BOUNDARY_MODES.index(self.boundary_mode)
+        self.boundary_mode = BOUNDARY_MODES[(i + 1) % len(BOUNDARY_MODES)]
+        self._field_dirty = True
+
+    def _inside(self, p):
+        """Bool mask of the (M, 2) positions inside the physics mesh [0, universe)."""
+        size = const_tensor((float(self.universe_w), float(self.universe_h)), p.device, p.dtype)
+        return ((p >= 0) & (p < size)).all(dim=1)
+
+    def _drop_outside(self):
+        """Open boundary: delete the particles that left the physics mesh (survivors stay compacted, in order)."""
+        n = self.num_active
+        inside = self._inside(self.pos[:n])
+        kept = int(inside.sum())
+        if kept == n:
+            return
+        self._flush_pending_orbits()   # compaction below would invalidate their index ranges
+        self.pos[:kept] = self.pos[:n][inside]
+        self.vel[:kept] = self.vel[:n][inside]
+        self.masses[:kept] = self.masses[:n][inside]
+        self.num_active = kept
+        self._field_dirty = True
 
     def capacity(self):
         """
@@ -220,7 +247,7 @@ class SimulationEngine:
     def _physics_params(self):
         return {
             'G': self.G,
-            'force_range': self.gravity_range,
+            'force_range': math.inf if self.gravity_range >= FORCE_RANGE_OFF else self.gravity_range,
             'spring_k': self.spring_k,
             'epsilon': self.epsilon,
             'sigma': self.sigma,
@@ -296,7 +323,14 @@ class SimulationEngine:
         else:
             # Thermal velocities; vel_mult = 1 (the slider default) gives the same spread as before
             new_vel = (torch.rand((count, 2), device=self.device) - 0.5) * THERMAL_SPEED * vel_mult
-            
+        if self.boundary_mode == 'open':
+            # Spawns outside the physics mesh would be deleted on the next step anyway
+            inside = self._inside(new_pos)
+            new_pos, new_vel = new_pos[inside], new_vel[inside]
+            count = len(new_pos)
+            if count == 0:
+                return
+
         start, end = self.num_active, self.num_active + count
         self.pos[start:end] = new_pos
         self.vel[start:end] = new_vel
@@ -314,7 +348,11 @@ class SimulationEngine:
         self._flush_pending_orbits()   # compaction below would invalidate their index ranges
         self._field_dirty = True
         uni_pos = torch.tensor([world_x, world_y], dtype=torch.float32, device=self.device)
-        distances = torch.norm(self.pos[:self.num_active] - uni_pos, dim=1)
+        d = self.pos[:self.num_active] - uni_pos
+        if self.periodic:
+            size = const_tensor((float(self.universe_w), float(self.universe_h)), d.device, d.dtype)
+            d -= size * torch.round(d / size)        # minimum image: the brush may straddle an edge
+        distances = torch.norm(d, dim=1)
         keep_mask = distances > world_radius
         new_count = keep_mask.sum().item()
         
@@ -340,8 +378,14 @@ class SimulationEngine:
             np_coords = np_coords[:available_slots]
             total_spawn = len(np_coords)
             
+        coords = torch.from_numpy(np_coords).to(self.device)
+        if self.boundary_mode == 'open':
+            coords = coords[self._inside(coords)]
+            total_spawn = len(coords)
+            if total_spawn == 0:
+                return
         start, end = self.num_active, self.num_active + total_spawn
-        self.pos[start:end] = torch.from_numpy(np_coords).to(self.device)
+        self.pos[start:end] = coords
         self.vel[start:end] = 0.0
         self.masses[start:end] = self._new_masses(total_spawn)
         self.num_active += total_spawn
@@ -354,8 +398,8 @@ class SimulationEngine:
             return
 
         n = self.num_active
-        # 1. Handle Boundaries. Periodic needs nothing here: positions are wrapped right after each drift
-        # (no deletion, so no per-frame compaction or GPU->CPU sync).
+        # 1. Handle Boundaries. Periodic needs nothing here: positions are wrapped right after each drift.
+        # Open deletes escaped particles after the drift (step 3).
         if self.boundary_mode == 'reflective_walls':
             p = self.pos[:n]
             v = self.vel[:n]
@@ -423,9 +467,9 @@ class SimulationEngine:
             self._field_dirty = False
         self.step_count += 1
 
-        # Apply fluid dampening cooling (if Lennard-Jones active in N-body mode)
-        if self.potential_type == 'lennard_jones' and self.solver_type == 'nbody':
-            self.vel[:n] *= 0.99
+        # 3. Open boundary: particles that drifted out of the physics mesh are gone
+        if self.boundary_mode == 'open':
+            self._drop_outside()
 
 
 # View toggles, colour ranges, band-pass and theme live in engine.view (a ViewState); engine.<name> forwards to it

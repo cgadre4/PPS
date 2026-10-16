@@ -52,7 +52,15 @@ def test_toggle_boundary(make_engine):
     eng.toggle_boundary()
     assert eng.boundary_mode == "reflective_walls" and not eng.periodic
     eng.toggle_boundary()
+    assert eng.boundary_mode == "open" and not eng.periodic
+    eng.toggle_boundary()
     assert eng.boundary_mode == "periodic"
+
+
+def test_open_is_the_default_boundary():
+    from particle_mesh.physics import engine as E
+    eng = E.SimulationEngine(initial_particles=10)
+    assert eng.boundary_mode == "open" and not eng.periodic
 
 
 def test_nbody_startup_cap(capsys):
