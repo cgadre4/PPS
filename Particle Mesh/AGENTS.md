@@ -41,7 +41,7 @@ uv run python main.py
   - `test_engine_commands.py`, `test_view_state.py`, `test_controls.py`, `test_settings.py`: engine commands, ViewState forwarding and palettes, input handling with a scripted fake window, settings vs `config.json`.
   - `test_layering.py`, `test_imports.py`, `test_cleanup.py`: package layering rules, import with no side effects, removed dead code.
   - `test_smoke.py`: the full app loop per mode, each in a subprocess via `tests/headless_main.py`.
-- **Benchmark:** `uv run python tools/bench_frame.py [1e6 4e6 ...]` reports step and render milliseconds with the app's backend selection. Flags: `--zoom Z`, `--field` (force arrows), `--frames N`, `--solver nbody` (direct N-body step + circle render), `--app` (whole `App.frame` offscreen, one count; A/B only, since unpresented GGUI work stalls the shared GPU and inflates the absolute numbers). Compare before and after performance changes.
+- **Benchmark:** `uv run python tools/bench_frame.py [1e6 4e6 ...]` reports step and render milliseconds with the app's backend selection. Flags: `--zoom Z`, `--field` (force arrows), `--frames N`, `--solver nbody` (direct N-body step + circle render), `--app` (whole `App.frame` offscreen, one count; A/B only: unpresented GGUI work stalls the shared GPU, ~75 ms/frame at 1M against ~11 ms in the real window). Compare before and after performance changes.
 - **Headless technique:** wrap `ti.ui.Window` with `show_window=False`, stub the input methods, and read `get_image_buffer_as_numpy()`. Don't call `window.show()` without a visible window; it crashes. GGUI supports one window per process. `app.build_app(window_factory=...)` takes the wrapper directly.
 - There is no build step or linter.
 - Don't set `PYTORCH_CUDA_ALLOC_CONF`/expandable segments for non-CUDA builds. PyTorch applies it to XPU too, and it measured ~15-20% slower (`bootstrap.configure_torch_env` only sets it when `torch.version.cuda`).
@@ -56,6 +56,7 @@ Taichi 1.7.4 has no XPU backend. On Vulkan it copies every non-CPU tensor argume
 - Particle hot paths go through `engine.kernels`. Particle Taichi kernels are launched only from the `particle_mesh.kernels` package (`kernels.nbody_accel` for N-body).
 - Data destined for a Taichi field (arrow and circle vertex buffers) goes through `runtime.device.to_taichi(tensor)` then `field.from_torch(...)`. That makes one explicit host copy only when memory isn't shared.
 - PM frames don't go through a Taichi field at all. They're copied once into a persistent pinned uint32 host buffer and handed to GGUI as a host-mapped image (`render/ggui_present.HostFramePresenter`).
+- The brush ring and the "show panel" arrow don't either. Their vertices sit in persistent NumPy buffers in GGUI's vertex layout, handed to the PyCanvas directly (`ggui_present.draw_host_circles`/`draw_host_triangles`). The public `canvas.circles`/`triangles` launch a Taichi copy kernel into a fresh NumPy buffer on every call, which waits for the Vulkan queue: ~1.3 ms of every windowed frame for the 64-dot ring.
 
 ### Measured performance (Arc B390, torch backend, 2048² grid, 2880×1800 window, `RENDER_CELL_SIZE` 2)
 
@@ -70,6 +71,7 @@ The ranges are thermal and power state. The same commit measured ~15 ms at 1M on
 Where the time goes at 1M:
 - **Step:** FFT solve ~3.3 ms (rfft2 1.0, ×K 0.36, irfft2 1.1, slice differences 1.2); fused CIC ~1.9 ms (sampler coordinates 0.2, deposit 0.7, halo 0.6, gather 0.4); integrate and wrap ~0.5 ms.
 - **Render:** ~2.1–3.2 ms at 1M: splat, count-LUT colour, one 5.2 MB readback, GGUI upload.
+- **Whole windowed `App.frame`** (visible window, panel open, no throttle): ~9.7 ms at 1M. Wall-clock per section: step 4–5.7, render_pm ~3.9, brush ring 0.4, panel 0.4, `window.show()` 0.8–1.2, input under 0.1.
 
 The next speed-up is fused Triton kernels / `torch.compile` (`AUDIT.md` §5.4 option B). That needs MSVC Build Tools; then set `TORCH_COMPILE: true`. Without a compiler it prints one notice and stays eager.
 
@@ -176,7 +178,7 @@ Input (`InputController.process` → `FrameIntent`) → brush spawn/erase → `e
 ### Taichi initialisation order
 
 - Importing never initialises Taichi or allocates fields, `main.py` included: every module can be imported in any order before `ti.init()`. `tests/test_imports.py` imports the whole package plus `main` and checks this.
-- `bootstrap.init_taichi()` is the single initialisation point and is idempotent. It must run before you construct a `SimulationEngine` (`kernels.make_backend` reads the active arch), `MeshRenderer`, `CircleRenderer` or `BrushOverlay` (they create Taichi fields in `__init__`). `app.main()`, `tests/conftest.py` and `tools/bench_frame.py` call `configure_torch_env()` then `init_taichi()`.
+- `bootstrap.init_taichi()` is the single initialisation point and is idempotent. It must run before you construct a `SimulationEngine` (`kernels.make_backend` reads the active arch), `MeshRenderer` or `CircleRenderer` (they create Taichi fields in `__init__`). `app.main()`, `tests/conftest.py` and `tools/bench_frame.py` call `configure_torch_env()` then `init_taichi()`.
 - Keep new Taichi fields out of module scope.
 
 ### Array layout conventions
@@ -198,7 +200,7 @@ All image math runs in PyTorch on the simulation device; Taichi only receives fi
   - `_present` delegates to `HostFramePresenter.present` (`render/ggui_present.py`, the only module touching Taichi's private canvas API). It pastes the overlay, copies the frame into the pinned host buffer, then calls the PyCanvas `set_image(host_info)`. That is what Taichi's own `Canvas.set_image` does after its to_rgba8 conversion, minus that conversion and the `from_torch` upload. A public-API fallback covers the case where the PyCanvas attribute disappears.
   - The minimap is cached and refreshed every `minimap_interval` frames. An identity band-pass skips the multiply (`bandpass_mask` returns `None`). The view grid is cached while the camera is still.
   - The potential, bandpass and vector-field views are fed by grid-sampled solver arrays instead.
-- **Overlays** are packed RGBA8 in `[x, y]` layout and must be pasted into the frame before it is handed to GGUI. The FFT minimap is passed as `overlay=`. The brush ring and the "show panel" arrow are GGUI primitives drawn afterwards (`render/overlays.BrushOverlay`).
+- **Overlays** are packed RGBA8 in `[x, y]` layout and must be pasted into the frame before it is handed to GGUI. The FFT minimap is passed as `overlay=`. The brush ring and the "show panel" arrow are GGUI primitives drawn afterwards from host vertex buffers (`render/overlays.BrushOverlay`; the ring is recomputed only when the cursor or brush size changes).
 - **Force arrows** sample the force grids only at the arrow centres. They are built as vertex/colour tensors in `MeshRenderer.render_vectors` and uploaded into `vector_verts`/`vector_colors`.
 - **N-body mode:** `CircleRenderer.render_nbody` colours particles by speed (theme gradient over 0–50) or by charge in Coulomb mode, normalises on-screen particles on the device and uploads them into buffers sized `min(290000, NBODY_MAX_PARTICLES)`.
 - Colour themes (`render/themes.py`) must have exactly **9** RGB entries in 0-255; the gradient interpolates between indices 0-8.

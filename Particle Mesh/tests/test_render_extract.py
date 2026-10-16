@@ -56,22 +56,63 @@ def test_presenter_owns_the_host_buffer(make_engine):
     assert renderer._host is renderer._presenter.host and renderer._host.shape == (MR.VIEW_W, MR.VIEW_H)
 
 
-def test_brush_overlay_draw_calls():
+def test_brush_overlay_host_buffers_skip_taichi_kernels():
     brush = BrushOverlay()
     calls = []
 
-    class Canvas:
-        def circles(self, field, radius, color):
-            calls.append(("circles", color))
+    class PyCanvas:
+        def circles(self, info, per_vertex_color, per_vertex_radius, color, radius):
+            calls.append(("circles", color, radius))
 
-        def triangles(self, field, color):
-            calls.append(("triangles", color))
+        def triangles(self, info, indices_info, per_vertex_color, color):
+            calls.append(("triangles", color, indices_info.valid))
+
+    class Canvas:
+        canvas = PyCanvas()
+
+        def circles(self, *a, **k):
+            raise AssertionError("public Canvas.circles launches a Taichi copy kernel")
+
+        triangles = circles
 
     brush.draw_ring(Canvas(), (0.5, 0.5), 100.0, 1000, 500, erasing=False)
     brush.draw_ring(Canvas(), (0.5, 0.5), 100.0, 1000, 500, erasing=True)
     brush.draw_arrow(Canvas())
-    assert calls == [("circles", (0.2, 0.8, 0.6)), ("circles", (1.0, 0.2, 0.2)), ("triangles", (0.8, 0.8, 0.8))]
-    ring = brush.ring_pos_field.to_numpy()
-    assert abs(ring[0][0] - 0.6) < 1e-6 and abs(ring[0][1] - 0.5) < 1e-6      # radius 100/1000 in x at angle 0
-    arrow = brush.arrow_verts.to_numpy()
+    assert calls == [("circles", (0.2, 0.8, 0.6), 0.001), ("circles", (1.0, 0.2, 0.2), 0.001),
+                     ("triangles", (0.8, 0.8, 0.8), False)]
+    ring = brush.ring_vbo
+    assert abs(ring[0, 0] - 0.6) < 1e-6 and abs(ring[0, 1] - 0.5) < 1e-6      # radius 100/1000 in x at angle 0
+    assert abs(ring[16, 0] - 0.5) < 1e-6 and abs(ring[16, 1] - 0.7) < 1e-6    # radius 100/500 in y at 90 degrees
+    assert abs(brush.arrow_vbo[0, 0] - 0.016) < 1e-6 and abs(brush.arrow_vbo[5, 1] - 0.975) < 1e-6
+
+
+def test_brush_overlay_public_api_fallback():
+    brush = BrushOverlay()
+    calls = []
+
+    class Canvas:  # no PyCanvas attribute
+        def circles(self, field, radius, color):
+            calls.append(("circles", color, field.to_numpy()))
+
+        def triangles(self, field, color):
+            calls.append(("triangles", color, field.to_numpy()))
+
+    brush.draw_ring(Canvas(), (0.5, 0.5), 100.0, 1000, 500, erasing=True)
+    brush.draw_arrow(Canvas())
+    (_, ring_color, ring), (_, arrow_color, arrow) = calls
+    assert ring_color == (1.0, 0.2, 0.2) and arrow_color == (0.8, 0.8, 0.8)
+    assert abs(ring[0][0] - 0.6) < 1e-6 and abs(ring[0][1] - 0.5) < 1e-6
     assert abs(arrow[0][0] - 0.016) < 1e-6 and abs(arrow[5][1] - 0.975) < 1e-6
+
+
+@pytest.mark.parametrize("erasing", [False, True])
+def test_brush_ring_reaches_the_frame(headless_canvas, erasing):
+    window, canvas = headless_canvas
+    w, h = MR.VIEW_W, MR.VIEW_H
+    canvas.set_background_color((0.0, 0.0, 0.0))
+    BrushOverlay().draw_ring(canvas, (0.5, 0.5), 100.0, w, h, erasing=erasing)
+    img = window.get_image_buffer_as_numpy()                     # [x, y, rgba], y = 0 at the bottom
+    for x, y in ((w // 2 + 100, h // 2), (w // 2, h // 2 + 100)):   # ring dots at 0 and 90 degrees
+        dot = img[x - 3:x + 4, y - 3:y + 4, :3].reshape(-1, 3)
+        r, g, _ = dot[dot.sum(axis=1).argmax()]
+        assert (r > 0.8 and g < 0.4) if erasing else (g > 0.6 and r < 0.4)

@@ -1,10 +1,47 @@
 """
-Hands finished frames to GGUI. The only module that touches Taichi's private canvas API (PyCanvas.set_image with a
-host-mapped buffer); it falls back to the public Canvas.set_image when that attribute is missing.
+Hands finished frames and overlay vertices to GGUI. The only module that touches Taichi's private canvas API
+(PyCanvas.set_image / circles / triangles with host-mapped buffers); callers fall back to the public Canvas API when
+that attribute is missing.
 """
 import numpy as np
 import torch
 from taichi.ui.utils import get_field_info
+
+# GGUI vertex layout (taichi.ui.staging_buffer): position 3, normal 3, texcoord 2, colour 4, all float32
+VERTEX_STRIDE = 12
+
+
+def _py_canvas(canvas, method):
+    """The PyCanvas behind a ti.ui.Canvas if it has `method`, else None."""
+    py_canvas = getattr(canvas, "canvas", None)
+    return py_canvas if py_canvas is not None and hasattr(py_canvas, method) else None
+
+
+def host_vertex_buffer(n):
+    """Persistent zeroed host vertex buffer for n vertices in GGUI's layout; 2D positions go in columns 0 and 1."""
+    return np.zeros((n, VERTEX_STRIDE), dtype=np.float32)
+
+
+def draw_host_circles(canvas, vbo, radius, color):
+    """
+    One-colour circles at the positions in a host_vertex_buffer, handed to PyCanvas.circles as host-mapped memory:
+    what Canvas.circles does after its copy_all_to_vbo_particle kernel, minus that kernel and its Vulkan wait.
+    Returns False when the PyCanvas attribute is missing (the caller then uses the public API).
+    """
+    py_canvas = _py_canvas(canvas, "circles")
+    if py_canvas is None:
+        return False
+    py_canvas.circles(get_field_info(vbo), False, False, color, radius)
+    return True
+
+
+def draw_host_triangles(canvas, vbo, color):
+    """One-colour triangles (consecutive vertex triples of a host_vertex_buffer); see draw_host_circles."""
+    py_canvas = _py_canvas(canvas, "triangles")
+    if py_canvas is None:
+        return False
+    py_canvas.triangles(get_field_info(vbo), get_field_info(None), False, color)
+    return True
 
 
 class HostFramePresenter:
@@ -35,8 +72,8 @@ class HostFramePresenter:
             w, h = min(thumb_w, self.view_w), min(thumb_h, self.view_h)
             image[:w, :h] = thumb[:w, :h]
         self.host.copy_(image)
-        py_canvas = getattr(canvas, "canvas", None)
-        if py_canvas is not None and hasattr(py_canvas, "set_image"):
+        py_canvas = _py_canvas(canvas, "set_image")
+        if py_canvas is not None:
             py_canvas.set_image(self.host_info)
         else:  # public-API fallback (e.g. a future Taichi without the PyCanvas attribute)
             rgb = np.ascontiguousarray(self.host_np.view(np.uint8).reshape(self.view_w, self.view_h, 4)[..., :3])
