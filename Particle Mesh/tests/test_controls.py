@@ -158,6 +158,40 @@ def test_spawn_and_erase_respect_panel(rig):
     assert not rig.frame(held={ti.ui.RMB, ti.ui.CTRL}, cursor=(0.5, 0.5)).erase      # Ctrl steers the brush size
 
 
+def test_zoom_out_stops_at_the_mesh_size(rig):
+    """The view can never span more than the physics mesh along either axis (drag or arrow keys)."""
+    cam = rig.camera
+    assert cam.min_zoom == pytest.approx(max(W / 8192, H / 8192))
+    for _ in range(5):
+        rig.frame(held={ti.ui.CTRL, ti.ui.LMB}, cursor=(0.5, 1.0))
+        rig.frame(held={ti.ui.CTRL, ti.ui.LMB}, cursor=(0.5, 0.0))
+        rig.frame()
+    assert cam.zoom == pytest.approx(cam.min_zoom)
+    assert W / cam.zoom <= 8192 + 1e-6 and H / cam.zoom <= 8192 + 1e-6
+    for _ in range(50):
+        rig.frame(held={ti.ui.DOWN})
+    assert cam.zoom == pytest.approx(cam.min_zoom)
+    for _ in range(5):
+        rig.frame(held={ti.ui.CTRL, ti.ui.LMB}, cursor=(0.5, 0.0))
+        rig.frame(held={ti.ui.CTRL, ti.ui.LMB}, cursor=(0.5, 1.0))
+        rig.frame()
+    assert cam.zoom == cam.max_zoom
+
+
+def test_camera_ignores_bad_zoom_factors():
+    cam = SimulationCamera(W, H, 8192, 8192)
+    before = (cam.cam_x, cam.cam_y, cam.zoom)
+    for factor in (0.0, -2.0, float("nan"), float("inf")):
+        cam.zoom_around_mouse(10.0, 10.0, factor)
+    assert (cam.cam_x, cam.cam_y, cam.zoom) == before
+
+
+def test_reset_respects_the_zoom_limit():
+    cam = SimulationCamera(W, H, 400, 400)                 # mesh smaller than the window
+    assert cam.zoom == cam.min_zoom == pytest.approx(W / 400)
+    assert cam.cam_x == pytest.approx(0.0) and cam.cam_y == pytest.approx((400 - H / cam.zoom) / 2)
+
+
 def test_keyboard_zoom(rig):
     z0 = rig.camera.zoom
     rig.frame(held={ti.ui.UP})

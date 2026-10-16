@@ -56,6 +56,22 @@ def test_open_boundary_deletes_escaped_particles(make_engine):
     assert eng.num_active == 1                                   # the third crossed x = universe_w
 
 
+def test_switching_boundary_applies_immediately(make_engine):
+    """Walls clamp at the start of a step, so particles can sit past the edge after the drift; switching to open
+    must not leave them there (nor periodic leave them unwrapped)."""
+    eng = make_engine(3, boundary='reflective_walls')
+    eng.pos[:3] = torch.tensor([[E.UNIVERSE_W + 5.0, CY], [E.UNIVERSE_W / 2, CY], [-3.0, CY]])
+    eng.toggle_boundary()                                           # walls -> open
+    assert eng.boundary_mode == 'open' and eng.num_active == 1
+    eng.pos[1] = torch.tensor([E.UNIVERSE_W + 5.0, CY])
+    eng.num_active = 2
+    eng.toggle_boundary()                                           # open -> periodic
+    assert eng.pos[1, 0].item() == pytest.approx(5.0, abs=1e-3)
+    eng.pos[1] = torch.tensor([-7.0, CY])
+    eng.toggle_boundary()                                           # periodic -> walls
+    assert eng.pos[1, 0].item() == 0.0
+
+
 def test_open_spawn_outside_the_mesh_is_dropped(make_engine):
     eng = make_engine(0, boundary='open')
     eng.add_galaxy(0.0, CY, 50.0, count=10000, vel_mult=0.0)     # disk centred on the left edge

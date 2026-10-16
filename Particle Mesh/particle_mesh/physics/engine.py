@@ -208,6 +208,17 @@ class SimulationEngine:
         i = BOUNDARY_MODES.index(self.boundary_mode)
         self.boundary_mode = BOUNDARY_MODES[(i + 1) % len(BOUNDARY_MODES)]
         self._field_dirty = True
+        # Apply the new boundary right away: particles may sit just outside the mesh (walls clamp at the start of
+        # a step, so a drift can leave them past the edge until the next one)
+        n = self.num_active
+        if self.boundary_mode == 'open':
+            self._drop_outside()
+        elif self.boundary_mode == 'periodic':
+            self.kernels.wrap(self.pos, n, self.universe_w, self.universe_h)
+        else:
+            size = const_tensor((float(self.universe_w), float(self.universe_h)), self.device, self.pos.dtype)
+            self.pos[:n].clamp_(min=0.0)
+            torch.minimum(self.pos[:n], size, out=self.pos[:n])
 
     def _inside(self, p):
         """Bool mask of the (M, 2) positions inside the physics mesh [0, universe)."""
