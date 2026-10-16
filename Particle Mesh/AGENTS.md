@@ -34,21 +34,26 @@ uv run python main.py
     - `taichi` when Taichi shares memory with the torch device (torch CUDA + Taichi CUDA, or torch CPU + Taichi CPU);
     - `torch` otherwise. The development laptop (Intel Arc B390) uses torch XPU + Taichi Vulkan, so it gets `torch`.
     - Override with `simulation.KERNEL_BACKEND`.
-- **Tests:** `uv run pytest` from this folder (~35 s, all headless). Run the suite before and after any change.
+- **Tests:** `uv run pytest` from this folder (~35 s, all headless). Run the suite before and after any change. `uv run pytest -m actions` adds the end-to-end action tests (~6 min, below).
   - `test_kernels.py`: torch vs Taichi backend parity. `test_nbody.py`: fused Taichi N-body kernel vs the torch reference.
   - `test_physics.py`, `test_physics_units.py`, `test_step_paths.py`: audit-bug regressions, periodic behaviour, PM vs N-body unit parity, step-path variants.
+  - `test_boundaries.py`: open-boundary deletion, no periodic images in the isolated solve, PM vs N-body agreement for every potential, screening on and off, the square isolated kernel.
+  - `make_engine` (in `conftest.py`) defaults to `boundary='periodic'`; the app defaults to `open`.
   - `test_rendering.py`, `test_render_extract.py`, `test_safety_net.py`: frame contents, view alignment, the extracted render pieces, and behaviour pinned before the refactor.
   - `test_engine_commands.py`, `test_view_state.py`, `test_controls.py`, `test_settings.py`: engine commands, ViewState forwarding and palettes, input handling with a scripted fake window, settings vs `config.json`.
   - `test_layering.py`, `test_imports.py`, `test_cleanup.py`: package layering rules, import with no side effects, removed dead code.
   - `test_smoke.py`: the full app loop per mode, each in a subprocess via `tests/headless_main.py`.
+  - `test_actions.py` (marker `actions`, a few minutes): every user action and the extremes of every slider through the real `App.frame`, in PM and N-body, via `tests/headless_actions.py` in a subprocess. It drives the real panel through a proxy of the ImGui object (scripted button presses and slider values; every widget still drawn), and after every frame checks: no crash, finite positions and velocities, count within capacity, no particle outside the mesh in open mode, zoom within limits. It fails if any panel button (except the file-dialog Browse) or slider was never exercised. Not part of the default run (`pytest.ini` deselects the marker; ~6 min): run it with `uv run pytest -m actions`, at least after changes to input, the panel, the camera, rendering or the engine step.
+  - `uv run python tests/headless_actions.py pm --visible` (or `nbody`) runs the same script in a real window, presenting every frame. `ACTIONS_TRACE=1` prints each step with the particle count, zoom and XPU memory; `ACTIONS_SYNC=1` synchronises and times each frame section, so an asynchronous GPU error is attributed to its section.
 - **Benchmark:** `uv run python tools/bench_frame.py [1e6 4e6 ...]` reports step and render milliseconds with the app's backend selection. Flags: `--zoom Z`, `--field` (force arrows), `--frames N`, `--solver nbody` (direct N-body step + circle render), `--app` (whole `App.frame` offscreen, one count; A/B only: unpresented GGUI work stalls the shared GPU, ~75 ms/frame at 1M against ~11 ms in the real window). Compare before and after performance changes.
-- **Headless technique:** wrap `ti.ui.Window` with `show_window=False`, stub the input methods, and read `get_image_buffer_as_numpy()`. Don't call `window.show()` without a visible window; it crashes. GGUI supports one window per process. `app.build_app(window_factory=...)` takes the wrapper directly.
+- **Headless technique:** wrap `ti.ui.Window` with `show_window=False`, stub the input methods, and read `get_image_buffer_as_numpy()`. Don't call `window.show()` without a visible window; it crashes. Offscreen, call `get_image_buffer_as_numpy()` every frame in its place: a loop that never draws lets GGUI work pile up until Level Zero fails with `UR_RESULT_ERROR_OUT_OF_RESOURCES` (seen after ~600 frames at 4M particles). On a visible window, don't read the image buffer outside `show()`: it breaks ImGui's frame scope (`g.WithinFrameScope` assertion abort). GGUI supports one window per process. `app.build_app(window_factory=...)` takes the wrapper directly.
 - There is no build step or linter.
 - Don't set `PYTORCH_CUDA_ALLOC_CONF`/expandable segments for non-CUDA builds. PyTorch applies it to XPU too, and it measured ~15-20% slower (`bootstrap.configure_torch_env` only sets it when `torch.version.cuda`).
 - In `nbody` mode, `simulation.NBODY_MAX_PARTICLES` (default 25,000) caps both the startup count (the engine constructor prints a warning) and brush/image spawning (`SimulationEngine.capacity()`).
   - The limit is O(N²) speed. With the default fused Taichi kernel on the B390: 10k ≈ 5 ms/step, 20k ≈ 8–10 ms, 40k ≈ 30 ms.
   - `NBODY_KERNEL: "torch"` selects the tiled PyTorch reference (memory ~0.13 GiB at any N, but ~30–100× slower: 10k ≈ 150 ms). Lower the cap if you use it.
-- Mouse-wheel input doesn't exist in Taichi 1.7 GGUI. Zoom and brush size use Z+drag and the arrow keys.
+- Mouse-wheel input doesn't exist in Taichi 1.7 GGUI (`ti.ui.Window`; only the legacy `ti.GUI` has it). Zoom is Ctrl+left drag (anchored where the drag started) or the up/down arrows. Brush size is Ctrl+right drag. Pan is middle drag or Space+left drag. `R` (or the panel's Reset View) re-centres at zoom 1. While Ctrl is held, nothing spawns or erases.
+- Zoom limits (`render/camera.py`): zoom-out stops where the view spans the physics mesh along one axis (`min_zoom = max(width / universe_w, height / universe_h)`, 0.35 at 2880×1800 and an 8192 universe); zoom-in stops at `MAX_ZOOM` (10000). `zoom_around_mouse` ignores non-finite or non-positive factors.
 
 ### Intel XPU rule: never pass XPU tensors to Taichi kernels
 
@@ -71,6 +76,7 @@ The ranges are thermal and power state. The same commit measured ~15 ms at 1M on
 Where the time goes at 1M:
 - **Step:** FFT solve ~3.3 ms (rfft2 1.0, ×K 0.36, irfft2 1.1, slice differences 1.2); fused CIC ~1.9 ms (sampler coordinates 0.2, deposit 0.7, halo 0.6, gather 0.4); integrate and wrap ~0.5 ms.
 - **Render:** ~2.1–3.2 ms at 1M: splat, count-LUT colour, one 5.2 MB readback, GGUI upload.
+- **Open boundary** (isolated solve, padded square FFT, 4× the cells): synced `engine.step` at 1M measured 12.9–14.0 ms vs 5.7–6.0 ms periodic on 2048² (cell 2), and 52.6–55.7 ms vs 19.5–21.7 ms on 4096² (an 8192² FFT). Periodic mode stays available when speed matters more than free-space boundaries.
 - **Whole windowed `App.frame`** (visible window, panel open, no throttle): ~9.7 ms at 1M. Wall-clock per section: step 4–5.7, render_pm ~3.9, brush ring 0.4, panel 0.4, `window.show()` 0.8–1.2, input under 0.1.
 
 The next speed-up is fused Triton kernels / `torch.compile` (`AUDIT.md` §5.4 option B). That needs MSVC Build Tools; then set `TORCH_COMPILE: true`. Without a compiler it prints one notice and stays eager.
@@ -85,7 +91,8 @@ The next speed-up is fused Triton kernels / `torch.compile` (`AUDIT.md` §5.4 op
   - `SORT_INTERVAL`: re-sort particles by grid tile every N PM steps; 0 disables.
   - `FIELD_INTERVAL`: opt-in multi-rate PM. Rebuild the field (deposit + FFT) every N steps and reuse it in between; spawns and erases force a rebuild. Default 1.
   - `NBODY_MAX_PARTICLES`, `NBODY_KERNEL` (`"auto"`/`"taichi"` = fused Taichi kernel, `"torch"` = tiled reference), grid size, `PHYSICS_CELL_SIZE`, `RENDER_CELL_SIZE`, particle limits, log-density colour range.
-  - The checked-in values are sized for the B390: 2048² grid, 4M max particles, 1M at startup. The 2048² float32 grid is 16 MB, which fits the 16 MB last-level cache; 4096² makes CIC ~9× slower per particle.
+  - The checked-in values are sized for the B390: 2048² grid with `PHYSICS_CELL_SIZE: 4` (an 8192-wide universe), `RENDER_CELL_SIZE: 1` (the render grid is the full 2880×1800 window), 4M max particles, 1M at startup. The 2048² float32 grid is 16 MB, which fits the 16 MB last-level cache; 4096² makes CIC ~9× slower per particle, and in `open` mode its 8192² padded FFT puts the step at ~54 ms at 1M.
+  - At cell size 4 the default LJ σ = 40 spans only 10 cells, so PM resolves the LJ core poorly (N-body is exact). Use σ ≳ 80 for PM Lennard-Jones.
 - `sliders`: every entry is `[min, max, default]`. Defaults (index `[2]`) are read through `SETTINGS.slider(name)` by `engine.py`, `view_state.py` and `ui/state.py`; `ui/panel.py` reads `[0]`/`[1]` for slider bounds. A new tunable parameter should follow this convention and get a shipped fallback in `settings._SLIDER_DEFAULTS`.
 
 ## Architecture
@@ -125,9 +132,12 @@ Input (`InputController.process` → `FrameIntent`) → brush spawn/erase → `e
   - Commands used by the panel: `set_potential(kind)` (resets masses/charges and rebuilds the kernel), `set_pressure_model(model)`, `toggle_boundary()`. Slider-driven parameters (G, friction, ...) are still plain attributes the panel writes, followed by `request_kernel_rebuild()` where a kernel depends on them.
   - View state lives in `engine.view` (a `ViewState`); `engine.show_fft`, `engine.bp_inner`, `engine.color_theme` and the other `ViewState` fields forward to it.
 - **UI state:** `Controls` (brush radius, spawn velocity/density, time scale, panel visibility) is shared by `InputController`, the panel and the frame loop. `Palettes` holds the theme tensors for the whole run (the LUT cache is keyed by tensor address).
-- **Boundaries.**
-  - `periodic` (default): the universe is a torus, matching the FFT solver. Positions are wrapped right after each drift (inside the gather kernel for PM, `kernels.wrap` for N-body), so particles are never deleted at the edges. CIC deposit/gather wrap their neighbour indices, and N-body uses minimum-image displacements.
-  - `reflective_walls`: clamps positions and bounces velocities in `engine.step`. CIC clamps instead of wrapping (edge-replicated halo; Taichi clamps to `[0, W-1]`).
+- **Boundaries** (`engine.BOUNDARY_MODES`; the panel button `toggle_boundary()` cycles open → periodic → reflective walls):
+  - `open` (default): particles that leave the physics mesh `[0, universe)` are deleted at the end of every step (`_drop_outside`, one GPU→CPU sync per step), and spawns or image loads outside it are dropped. The PM field is an **isolated** solve (zero-padded square FFT, below), so there are no periodic images. N-body uses plain displacements.
+  - `periodic`: the universe is a torus. Positions are wrapped right after each drift (inside the gather kernel for PM, `kernels.wrap` for N-body), so particles are never deleted at the edges. CIC deposit/gather wrap their neighbour indices, and N-body uses minimum-image displacements. Only this mode uses the periodic FFT.
+  - `reflective_walls`: clamps positions and bounces velocities in `engine.step`, with the isolated solve. CIC clamps instead of wrapping (edge-replicated halo; Taichi clamps to `[0, W-1]`).
+  - `engine.periodic` is true only for `periodic`; every non-periodic mode is isolated.
+  - Mirror symmetry in the default scene is the initial condition, not a bug: the startup particles are a uniform rectangle centred in the universe, which collapses symmetrically. From a lopsided start the density's correlation with its mirror images decays to ~0.03.
 - **Particle kernels (`particle_mesh.kernels`)** have one interface (`ParticleKernels`) with two implementations:
   - `torch_impl.py`: pure PyTorch, any device. CIC uses the fused bilinear sampler on a one-cell-padded grid: gather = `grid_sample`, deposit = `aten::grid_sampler_2d_backward` with the masses as the gradient. The halo wraps (periodic) or replicates the edge (clamped).
     - The `CICStencil` is just the normalised sampler coordinates (one `addcmul`), shared by deposit and gather.
@@ -143,17 +153,20 @@ Input (`InputController.process` → `FrameIntent`) → brush spawn/erase → `e
 - **Friction** is applied as `exp(-friction * dt)`, computed on the host, so it can never flip a velocity's sign.
 - **PM solver (`physics/pm_solver.py`)**, per step:
   1. `kernels.prepare` → `kernels.deposit` (overwrites `density_grid`).
-  2. `rfft2` (kept as `rho_k`, which the FFT minimap and bandpass view reuse with no extra FFT).
-  3. Multiply by the cached `K_eff = K_k * Gaussian softening / N`, then `irfft2(norm='forward')` to `phi`. The 1/N lives in `K_eff`, saving a normalisation pass.
+  2. Forward FFT. Periodic: `rfft2` of the `(H, W)` grid, kept as `rho_k`. Isolated (open / walls): the grid zero-padded to an `S×S` square, `S = 2·max(W, H)` (`pot_manager.isolated_size`), done as a row `rfft` over only the H non-empty rows then a column `fft`. Then `rho_k` (the unpadded spectrum, for the FFT minimap, band-pass view and pressure) is computed on first use.
+  3. Multiply by the cached `K_eff = K_k / N_fft` (times Gaussian softening for the analytic periodic gravity/Coulomb kernel only), then inverse FFT to `phi`. Isolated: column `ifft`, then the row `irfft` of only the H rows inside the mesh, cropped to `(H, W)`. The 1/N lives in `K_eff`, saving a normalisation pass.
   4. `grid_ops.neg_gradient` writes central differences by slicing straight into `fx`/`fy` (wrapped edges when periodic, one-sided otherwise).
   5. `before_gather` hook (spawned-disk orbit speeds), then optional pressure forces.
   6. `kernels.gather_integrate`: kick (forces, charge, pressure, uniform gravity), drift, wrap. With `FIELD_INTERVAL` > 1, steps that don't rebuild the field skip 1–5.
 
   `phi`, `fx`, `fy` and `density_grid` are kept on the solver and read by the renderer.
-- **Units and force laws (shared by both solvers; `tests/test_physics_units.py` checks PM vs N-body parity):**
-  - Gravity and Coulomb follow the 2D law `|a| = G·m/r`. PM solves `lap(phi) = 2π·G·ρ_area`; the deposited mass per cell is divided by `cell_size²` inside the kernel (`area_scale` in `potentials.py`). N-body uses `G·m·dx/(r² + ε²)`.
-  - Harmonic springs use mean-field scaling (force per unit total mass, i.e. ÷N) in both solvers.
-  - Lennard-Jones and harmonic PM kernels are FFTs of a sampled `V(r)` and need no area factor.
+- **Units and force laws (shared by both solvers; `tests/test_physics_units.py` and `tests/test_boundaries.py` check PM vs N-body parity):**
+  - **One force law.** `potentials.attraction(kind, params, d)` is the N-body law: Plummer-softened `r = sqrt(d² + ε²)`, screening `exp(-r/range)`. Every PM kernel except periodic gravity/Coulomb is the potential `V(d) = -∫_d^{r_max} a(s) ds` of that law (integrated on a fine radial table in float64, zero at `r_max` to keep float32 precision), sampled on the grid and FFT'd. So PM and N-body agree by construction, screening included.
+  - Gravity and Coulomb follow the 2D law `|a| = G·m/r` (from `lap(phi) = 2π·G·ρ`, whose solution is `phi = G·m·ln r`). N-body uses `G·m·dx/(r² + ε²)`. The periodic PM kernel is analytic, `phi_k = -2π·G·ρ_area_k/(k² + 1/range²)`, with the mass per cell divided by `cell_size²` (`area_scale`); its screening is Yukawa, so only that mode differs from N-body at long range.
+  - The force-range slider's maximum (`engine.FORCE_RANGE_OFF`, 8192, the default) means **no screening** (`force_range = inf`): pure 2D gravity.
+  - Harmonic springs use mean-field scaling (force per unit total mass, i.e. ÷N) in both solvers. Screening multiplies the force, so springs always attract (the old PM kernel screened the potential and turned repulsive beyond 2·range).
+  - Lennard-Jones: the repulsive `F = 24ε/r·(2(σ/r)¹² − (σ/r)⁶)`, clamped to ±5e5, pushes the target away from the source in both solvers (N-body had the sign flipped). PM resolves the core only to about the CIC width (~1.4× too strong at 15 cells' separation).
+  - Sampled kernels need no area factor (a discrete convolution with mass per cell already sums `V` over particles).
   - Pressure is `a = -∇P/ρ`, `P = K·ρ^γ`, on a Gaussian-smoothed number density per unit area with a density floor. In Coulomb mode, pressure uses a separate `|mass|` deposit and is gathered without the charge factor (`accel_x/accel_y`).
   - Spawned gravity disks get their circular speed from the field they actually feel: `v = vel_mult · sqrt(r · a_inward)`.
     - `add_galaxy` queues the disk in `_pending_orbits`. The next `step()` sets the speeds from that step's own field, via `pm_solver.sample_forces` (bilinear, which equals CIC) or the N-body accelerations, so spawning costs no extra solve.
@@ -161,19 +174,22 @@ Input (`InputController.process` → `FrameIntent`) → brush spawn/erase → `e
     - The field includes the disk itself, existing particles, softening, screening and periodic images.
     - `vel_mult` is the "Spawn Velocity (x orbit)" slider (1 = circular). Disks hold their radius to within 0.5% over 2 s.
     - Other potentials get a thermal spread of `THERMAL_SPEED·vel_mult`.
-  - Default G is 0.64, retuned so the default PM scene keeps its pre-fix strength at `PHYSICS_CELL_SIZE: 2`.
+  - Default G is 0.64, tuned when gravity was screened at range 100 with `PHYSICS_CELL_SIZE: 2`. With screening off by default, the startup rectangle now collapses as a whole within a few seconds.
 - **Kernel caching:**
-  - `potentials.py` `PotentialsManager.get_fourier_kernel` builds `K_k`: gravity/Coulomb analytically as screened Yukawa `-+G/(k^2 + 1/range^2)`, harmonic/LJ by FFT of a real-space periodic potential on the full grid.
-  - `K_k[0, 0]` is always zeroed, so phi has zero mean. Don't remove that: the mean term destroys float32 precision in phi.
-  - The PM solver only rebuilds `K_k` when the potential *type* changes. Any change to a kernel parameter (G, force range, spring_k, epsilon, sigma) must trigger a rebuild: `engine.request_kernel_rebuild()` (debounced; what the GUI sliders use) or `engine.precompute_kernel()` (immediate).
+  - `potentials.py` `PotentialsManager.get_fourier_kernel(kind, params, isolated)` builds `K_k`.
+    - Periodic gravity/Coulomb: analytic screened Yukawa `-+G/(k^2 + 1/range^2)`, `(H, W//2+1)`.
+    - Periodic harmonic/LJ: the force-law potential at minimum-image distances on the `(H, W)` grid (the periodic N-body convention).
+    - Isolated (open / walls): the force-law potential on the **square** `S×S` padded grid, `(S, S//2+1)`. Every pair offset inside the mesh maps to a unique kernel cell, so there are no images, and the kernel reaches equally far along both axes. Building it at S = 8192 takes ~0.5–0.7 s.
+  - Periodic kernels have `K_k[0, 0]` zeroed, so phi has zero mean. Don't remove that: the mean term destroys float32 precision in phi. Isolated kernels keep it (the free-space sum is the physics; `V(r_max) = 0` keeps phi small instead).
+  - The PM solver rebuilds `K_k` by itself when the potential *type* or the boundary kind (periodic vs isolated) changes. Any change to a kernel parameter (G, force range, spring_k, epsilon, sigma, softening) must trigger a rebuild: `engine.request_kernel_rebuild()` (debounced; what the GUI sliders use) or `engine.precompute_kernel()` (immediate).
   - `K_eff` is rebuilt automatically when `K_k` (tracked by a version counter, not `id()`) or the softening length changes.
-  - Kernels and `k_sq` are stored in **rfft2 half-spectrum layout** `(H, W//2+1)`. Gravity/Coulomb `K_k` is real; harmonic/LJ is the complex `rfft2` of `V(r)`. `pm_solver.k_sq` is the same tensor as `pot_manager.k_sq`. The real-space distance grid is built on demand only.
+  - Kernels are stored in **rfft2 half-spectrum layout**. `k_sq` is always the unpadded `(H, W//2+1)` grid. `pm_solver.k_sq` is the same tensor as `pot_manager.k_sq`. Real-space potentials are sampled in row chunks and freed after the FFT.
   - GUI sliders call `engine.request_kernel_rebuild()`, which is debounced: the rebuild runs in `step()` once the value has been still for `KERNEL_REBUILD_DELAY` (0.15 s). Call `precompute_kernel()` directly when an immediate rebuild is needed (`set_potential` does).
 - **N-body solver (`physics/nbody_solver.py`)** computes exact pairwise accelerations. Integration happens in `engine.step`.
   - **Default:** one fused Taichi kernel (`taichi_impl.nbody_accel_kernel`, one thread per target, no N×N temporaries), launched through `kernels.nbody_accel`. It's zero-copy where Taichi shares memory with torch. On the laptop it deliberately hops through small CPU tensors (8 B/particle), the one place where crossing between XPU and Vulkan is cheap.
   - **Reference/fallback:** the tiled PyTorch path (`_solve_torch`, `TILE_ELEMENTS` per tile).
   - `tests/test_nbody.py` checks that the two agree.
-- **Adding or changing a potential touches five places:** `potentials.get_fourier_kernel` (PM); `nbody_solver` (`_KINDS`, `_solve_torch`) plus `taichi_impl.nbody_accel_kernel` (N-body); `engine.POTENTIALS` and the `precompute_kernel`/`step` param dicts; the buttons/sliders in `ui/panel.py`.
+- **Adding or changing a potential touches five places:** `potentials.attraction` (the force law the PM kernels are built from; plus `get_fourier_kernel` if it gets an analytic periodic kernel); `nbody_solver` (`_KINDS`, `_solve_torch`) plus `taichi_impl.nbody_accel_kernel` (N-body, same law as `attraction`); `engine.POTENTIALS` and the `precompute_kernel`/`step` param dicts; the buttons/sliders in `ui/panel.py`.
 
 ### Taichi initialisation order
 
@@ -189,7 +205,7 @@ Input (`InputController.process` → `FrameIntent`) → brush spawn/erase → `e
 - The viewport is measured in **render cells** (`RENDER_CELL_SIZE` screen pixels each; `VIEW_W = WIDTH / RENDER_CELL_SIZE`), not pixels.
   - Any code that maps a render-cell index to world coordinates must multiply by `RENDER_CELL_SIZE` before dividing by `zoom`.
   - Anything drawn into the frame is sized in render cells.
-  - The shipped config uses `RENDER_CELL_SIZE: 2`, so this bug class shows up immediately.
+  - The shipped config now uses `RENDER_CELL_SIZE: 1`, which hides this bug class. When changing render code, also test with `RENDER_CELL_SIZE: 2` (`test_rendering.py` covers view alignment at the configured value).
 
 ### Rendering
 

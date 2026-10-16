@@ -2,6 +2,7 @@ import torch
 import math
 
 from particle_mesh.physics.grid_ops import neg_gradient
+from particle_mesh.physics.potentials import uses_analytic_kernel
 
 
 class ParticleMeshSolver:
@@ -22,17 +23,20 @@ class ParticleMeshSolver:
         self._py = torch.zeros((self.grid_h, self.grid_w), device=self.device)
         self._number = None                                                          # Coulomb: |mass| deposit
         self._pressure_accel = None    # (px, py) gathered without the charge factor (Coulomb + pressure)
-        self.rho_k = None  # rfft2 of the last deposited density; reused by the FFT minimap and bandpass view
+        self._rho_k = None  # rfft2 of the last deposited density (see the rho_k property)
         self.field_valid = False
 
         # |k|^2 in rfft2 layout (H, W//2 + 1), shared with the potentials manager
         self.k_sq = potentials_manager.k_sq
+        # Isolated (open / walled) solves: zero-padded square FFT of side S (potentials.PotentialsManager)
+        self.isolated_size = potentials_manager.isolated_size
         # Inverse FFTs use norm='forward' (no separate 1/N pass, measured 1.36 -> 1.09 ms at 2048^2); the 1/N is
         # folded into the cached kernels instead (AUDIT §8 F24).
         self._inv_cells = 1.0 / (self.grid_w * self.grid_h)
 
         self.K_k = None
         self.active_potential_type = None
+        self.kernel_isolated = None    # whether K_k is the padded free-space kernel
         self._kernel_version = 0   # bumped on every rebuild; part of the K_eff cache key (id() can be reused)
         # K_k * Gaussian softening / N, in rfft2 layout; rebuilt only when the kernel or the softening changes
         self._K_eff = None
@@ -41,44 +45,70 @@ class ParticleMeshSolver:
         self._smooth = None
         self._smooth_key = None
 
-    def update_kernel(self, potential_type, params):
+    @property
+    def rho_k(self):
+        """rfft2 of the last deposited density, (H, W//2 + 1), for the FFT minimap, band-pass view and pressure.
+        Periodic solves reuse their own transform; isolated solves (padded FFT) compute it on first use."""
+        if self._rho_k is None and self.field_valid:
+            self._rho_k = torch.fft.rfft2(self.density_grid)
+        return self._rho_k
+
+    def update_kernel(self, potential_type, params, isolated=False):
         """
-        Retrieves the updated Fourier kernel from potentials.py.
+        Retrieves the updated Fourier kernel from potentials.py: the periodic (H, W) kernel, or the zero-padded
+        square free-space kernel when isolated (open boundary or reflective walls).
         """
         self.active_potential_type = potential_type
-        self.K_k = self.pot_manager.get_fourier_kernel(potential_type, params)
+        self.kernel_isolated = isolated
+        self.K_k = self.pot_manager.get_fourier_kernel(potential_type, params, isolated)
         self._kernel_version += 1
 
     def _compute_field(self, stencil, pos, masses, num_active, potential_type, params, periodic):
         """
-        Deposit -> rfft2 -> kernel (with Gaussian softening) -> irfft2 -> central differences.
-        Updates self.density_grid, self.rho_k, self.phi, self.fx, self.fy (the force per unit mass/charge).
+        Deposit -> FFT -> kernel -> inverse FFT -> central differences. Periodic: the (H, W) grid. Isolated: the
+        grid zero-padded to an S x S square, so no periodic images. Updates self.density_grid, self.phi,
+        self.fx, self.fy (the force per unit mass/charge) and the density spectrum (rho_k).
         """
-        # Re-fetch kernel if the potential type switched
-        if self.K_k is None or self.active_potential_type != potential_type:
-            self.update_kernel(potential_type, params)
+        isolated = not periodic
+        # Re-fetch kernel if the potential type or the boundary kind switched
+        if self.K_k is None or self.active_potential_type != potential_type or self.kernel_isolated != isolated:
+            self.update_kernel(potential_type, params, isolated)
 
         # Scatter masses (the backend overwrites density_grid)
         self.kernels.deposit(stencil, pos, masses, num_active, self.density_grid, self.cell_size, periodic)
 
-        # Forward Real-FFT (rfft2)
-        rho_k = torch.fft.rfft2(self.density_grid)
-        self.rho_k = rho_k
+        # Forward real FFT. Isolated: rows (only the H non-zero ones) padded to S, then columns padded to S;
+        # the same layout as rfft2 at size (S, S), without transforming the empty padding rows.
+        s = self.isolated_size
+        if isolated:
+            rho_k = torch.fft.fft(torch.fft.rfft(self.density_grid, n=s, dim=1), n=s, dim=0)
+            self._rho_k = None
+        else:
+            rho_k = torch.fft.rfft2(self.density_grid)
+            self._rho_k = rho_k
 
-        # Convolution with the kernel, Gaussian force softening and the inverse-FFT 1/N (cached product)
+        # Kernel times the inverse-FFT 1/N (cached product); the exact periodic gravity/Coulomb kernel also gets
+        # Gaussian force softening (sampled real-space kernels carry the N-body Plummer softening already)
         softening_length = params.get('softening_length', 1.5)
         key = (self._kernel_version, softening_length)
         if self._K_eff_key != key:
-            gaussian = torch.exp(-self.k_sq * (softening_length**2) / 2.0).mul_(self._inv_cells)
-            self._K_eff = self.K_k * gaussian
+            if uses_analytic_kernel(potential_type, isolated):
+                gaussian = torch.exp(-self.k_sq * (softening_length**2) / 2.0).mul_(self._inv_cells)
+                self._K_eff = self.K_k * gaussian
+            else:
+                self._K_eff = self.K_k * (1.0 / (s * s) if isolated else self._inv_cells)
             self._K_eff_key = key
         phi_k = rho_k * self._K_eff
         if potential_type == 'harmonic':
             # Mean-field scaling: spring force per unit total mass, as in the N-body solver (independent of N)
             phi_k.mul_(1.0 / num_active)
 
-        # Inverse FFT to get potential
-        self.phi = torch.fft.irfft2(phi_k, s=self.density_grid.shape, norm='forward')
+        # Inverse FFT to get potential. Isolated: columns first, then only the H rows inside the mesh
+        if isolated:
+            phi_rows = torch.fft.ifft(phi_k, dim=0, norm='forward')[:self.grid_h]
+            self.phi = torch.fft.irfft(phi_rows, n=s, dim=1, norm='forward')[:, :self.grid_w]
+        else:
+            self.phi = torch.fft.irfft2(phi_k, s=self.density_grid.shape, norm='forward')
 
         # Forces F = -grad(phi), central differences written straight into the force buffers
         neg_gradient(self.phi, self.fx, self.fy, self.cell_size, periodic)

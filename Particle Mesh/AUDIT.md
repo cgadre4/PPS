@@ -89,6 +89,8 @@ For gravity and Coulomb, `K_k[0,0] = ∓G/λ²` with λ = 1/force_range. After `
 ### 2.8 Periodic forces with non-periodic particles (Medium)
 **Fixed** in the XPU port, which takes the truly periodic option. Positions wrap after each drift, CIC wraps its neighbour indices, N-body uses minimum-image displacements, and forces use periodic central differences. Particles are no longer deleted at the edges, which also removes the per-frame `.item()` sync. `reflective_walls` is unchanged.
 
+*Status, 2026-10-16:* the isolated option is now the default `open` boundary. Particles that leave the mesh are deleted (one sync per step), and the field is a zero-padded square FFT of side 2·max(W, H) with the free-space kernel. `reflective_walls` uses the same isolated solve, so the opposite-wall pull is gone. `periodic` is still available. Measured cost: the step goes 5.7–6.0 → 12.9–14.0 ms at 1M on 2048², and 19.5–21.7 → 52.6–55.7 ms on 4096².
+
 The FFT treats the universe as a torus, but in `wrap_delete` mode particles that leave are deleted. Near an edge, a particle feels the periodic image of mass on the opposite side. The CIC scatter also clamps rather than wraps (`pm_solver.py:14-15,38-39`), which piles the outermost half-cell of mass onto the edge cells.
 
 Pick one model:
@@ -122,6 +124,7 @@ The minimap size (`main.py:380-381`) is also in pixels but is written into a ren
 - The softening slider is relabelled "Force Softening Length".
 - Measured PM vs N-body: gravity and Coulomb within 0.7%, harmonic within 0.2%.
 - Default G is retuned from 1.0 to 0.64, keeping the default PM scene's strength.
+- *2026-10-16:* every PM kernel except periodic gravity/Coulomb is now built from the N-body force law (`potentials.attraction`), so screening matches as well. Two bugs fixed: PM harmonic springs turned repulsive beyond 2·range (the potential was screened instead of the force), and N-body Lennard-Jones had its sign flipped (core attracted, tail repelled). The N-body LJ `vel *= 0.99` per step (frame-rate dependent hidden damping) is removed. The force-range default is now "off" (no screening), i.e. the pure 2D law.
 
 - **Gravity/Coulomb:** PM solves ∇²φ = Gρ, giving `|g| = G·M/(2π r)`. N-body uses `G·m·dx/r²`, giving `|g| = G·M/r`. The same G is therefore 2π stronger in N-body.
 - **Harmonic:** N-body divides by N (`nbody_solver.py:57`); PM does not.
@@ -359,7 +362,8 @@ A read-only multi-agent sweep produced these findings. Each one was then checked
 | F33/F34 | N-body torch path: fewer passes per tile, symmetric tile pairs | N-body | ~1.5–2.5× | Superseded by F36 (the torch path is now only the reference/fallback) |
 | F19, R4.1 | Opt-in config tradeoffs: 2048×1280 grid, `RENDER_CELL_SIZE` 3 | config | ~1.5–2.7 ms each | Documented option |
 | F05 | int32 stencil | step | ~1–1.6 ms at 1M | Not needed (F02 is faster) |
-| F06, F08, F17, F18, F28, F35, F47 | Single force buffer, pipelined present, direct ring VBO, render from density grid, fixed-size splat scatter, far-pair culling, Taichi colour expansion | various | ≤0.5 ms each, or scenario-dependent | Not pursued (uncertain or small) |
+| F17 | Direct ring VBO (host vertex buffers for the brush ring and panel arrow) | render | measured windowed frame 10.2–10.35 → 9.7 ms at 1M | Done (PR #12) |
+| F06, F08, F18, F28, F35, F47 | Single force buffer, pipelined present, render from density grid, fixed-size splat scatter, far-pair culling, Taichi colour expansion | various | ≤0.5 ms each, or scenario-dependent | Not pursued (uncertain or small) |
 | F14–F16, F25, F26, F29–F31, F37–F40, F42–F46, F49, F50, R1–R6 | Time-based or rolling sorts, erase fast path, batched iFFTs, real LJ kernels, `inference_mode`, ImGui trims, XPUGraphs, circle VBO, cap/workspace/chunking changes, CUDA texture present, Taichi fusions and atomics, spectral forces, NGP, a Vulkan particle backend, frame pacing | various | refuted: negligible, slower, or infeasible | Rejected |
 
 The critic's main idea, moving particles into Taichi Vulkan ndarrays on the laptop, was rejected. Each step would hand 2 × 16 MB grids across through the host, costing ~12–18 ms per step (§5.3), which outweighs the 4–6× faster particle kernels at the default 1M particles.
