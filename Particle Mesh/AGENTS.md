@@ -21,11 +21,14 @@ This folder lives inside the `PPS` repo (`../`), which also holds `Ep1/` (unrela
 ## Running
 
 ```bash
-uv run python main.py
+uv run --no-project setup_env.py   # once per machine, from the repo root
+uv run python main.py              # from this folder
 ```
 
 - `uv run python -m particle_mesh` does the same. `main.py` is a thin entry point; the app is `particle_mesh/app.py`.
-- Run from this folder. uv finds the project at the repo root. Python 3.13 (`../.python-version`); `torch` comes from the PyTorch XPU wheel index (`[tool.uv] extra-index-url` in `../pyproject.toml`).
+- Run from this folder. uv finds the project at the repo root. Python 3.13 (`../.python-version`).
+- torch has one build per GPU vendor, so `../pyproject.toml` puts `torch`/`torchvision` in three conflicting extras, each with its own PyTorch wheel index: `cuda` (cu130, the RTX 5090 desktop), `xpu` (the Intel Arc B390 laptop) and `cpu`. `../setup_env.py` detects the GPU (NVIDIA via `nvidia-smi` → `cuda`; Intel Arc → `xpu`; else `cpu`) and runs `uv sync --extra <name>`; `--backend` forces one, `--dry-run` only reports. Plain `uv run` doesn't remove the installed build, but a bare `uv sync` without `--extra` does: rerun `setup_env.py` after one.
+- If the installed build can't use the machine's GPU (for example the laptop's XPU build on the desktop), the startup banner prints a warning naming the fix (`runtime.device.torch_build_hint`).
 - `config.json` is read once by `particle_mesh/settings.py` (path resolved from that file), so the working directory doesn't matter for config. It does matter for the panel (`ui/panel.py`), which scans the current directory for spawnable images (at startup and on "Rescan Images").
 - Device and backend selection at startup (a status banner prints the result, `bootstrap.print_status`):
   - torch device: CUDA if available, else Intel XPU, else CPU (`runtime.device.get_torch_device`).

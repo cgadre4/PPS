@@ -8,12 +8,53 @@ dependencies = [
     "pillow",
     "pygame",
     "taichi>=1.7.4",
-    "torch",
-    "torchvision",
 ]
 
+# torch has one build per GPU vendor. Pick one per machine with setup_env.py (it detects the hardware and runs
+# `uv sync --extra <name>`); plain `uv run` afterwards keeps whichever build is installed.
+[project.optional-dependencies]
+cuda = ["torch", "torchvision"]
+xpu = ["torch", "torchvision", "triton-xpu; python_full_version < '3.15'"]
+cpu = ["torch", "torchvision"]
+
 [tool.uv]
-extra-index-url = ["https://download.pytorch.org/whl/xpu"]
+conflicts = [
+    [
+        { extra = "cuda" },
+        { extra = "xpu" },
+        { extra = "cpu" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", extra = "cuda" },
+    { index = "pytorch-xpu", extra = "xpu" },
+    { index = "pytorch-cpu", extra = "cpu" },
+]
+torchvision = [
+    { index = "pytorch-cu130", extra = "cuda" },
+    { index = "pytorch-xpu", extra = "xpu" },
+    { index = "pytorch-cpu", extra = "cpu" },
+]
+# torch+xpu depends on triton-xpu, which is published only on the PyTorch XPU index
+triton-xpu = { index = "pytorch-xpu", extra = "xpu" }
+
+# CUDA 13.0 wheels cover the RTX 50 series (sm_120) and need an NVIDIA driver that reports CUDA 13.0 or newer
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [dependency-groups]
 dev = [
