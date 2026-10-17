@@ -9,6 +9,7 @@ import os
 import taichi as ti
 import torch
 
+from particle_mesh.runtime.device import torch_build_hint
 from particle_mesh.settings import SETTINGS
 
 
@@ -93,4 +94,7 @@ def print_status(engine):
         print("  [NOTE] PyTorch is performing FFTs on CPU cores.")
         print(f"         Grid size: {SETTINGS.grid_w}x{SETTINGS.grid_h} cells.")
         print("         Consider reducing PHYSICS_GRID_W/H to 1024 or 2048 if CPU usage is too high.")
+    hint = torch_build_hint(engine.device)
+    if hint:
+        print(f"  [WARNING] Running on CPU: {hint}")
     print("=" * 65)
