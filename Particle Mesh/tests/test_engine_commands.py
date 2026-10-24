@@ -50,8 +50,6 @@ def test_toggle_boundary(make_engine):
     eng = make_engine(10)
     assert eng.boundary_mode == "periodic" and eng.periodic
     eng.toggle_boundary()
-    assert eng.boundary_mode == "reflective_walls" and not eng.periodic
-    eng.toggle_boundary()
     assert eng.boundary_mode == "open" and not eng.periodic
     eng.toggle_boundary()
     assert eng.boundary_mode == "periodic"

@@ -3,6 +3,7 @@ Frame-time benchmark: engine.step + the real PM frame (MeshRenderer.render_pm: d
 packed present), offscreen.
 
     uv run python tools/bench_frame.py [counts...] [--zoom Z] [--field] [--frames N] [--solver pm|nbody] [--app]
+                                       [--boundary open|periodic] [--potential P] [--range R]
     e.g.  uv run python tools/bench_frame.py 1e6 4e6
           uv run python tools/bench_frame.py 1e6 --zoom 4      (zoomed-in camera: most particles off screen)
           uv run python tools/bench_frame.py 1e4 2e4 --solver nbody   (direct N-body step + circle render)
@@ -43,9 +44,14 @@ def _sync(device):
         torch.xpu.synchronize()
 
 
-def bench(n, frames, canvas, zoom=1.0, field=False, solver="pm"):
+def bench(n, frames, canvas, zoom=1.0, field=False, solver="pm", boundary=None, potential="gravity",
+          force_range=None):
     eng = E.SimulationEngine(initial_particles=n, solver=solver)
-    eng.precompute_kernel()
+    if boundary is not None:
+        eng.boundary_mode = boundary
+    if force_range is not None:
+        eng.gravity_range = force_range
+    eng.set_potential(potential)          # also builds the kernel
     eng.show_field = field
     renderer = MR.MeshRenderer(eng.kernels)
     camera = SimulationCamera(MR.WIDTH, MR.HEIGHT, eng.universe_w, eng.universe_h)
@@ -131,6 +137,11 @@ def main_():
     parser.add_argument("--frames", type=int, default=0, help="frames to time (default 100, or 60 above 2M)")
     parser.add_argument("--solver", choices=("pm", "nbody"), default="pm", help="solver to time (default pm)")
     parser.add_argument("--app", action="store_true", help="time the whole App.frame (one count only; GGUI allows one window)")
+    parser.add_argument("--boundary", choices=("open", "periodic"), default=None,
+                        help="boundary mode (default: the engine's, open)")
+    parser.add_argument("--potential", choices=("gravity", "coulomb", "harmonic", "lennard_jones"), default="gravity")
+    parser.add_argument("--range", type=float, default=None, dest="force_range",
+                        help="force range (default: the slider default, i.e. no screening)")
     args = parser.parse_args()
 
     if args.app:
@@ -142,12 +153,14 @@ def main_():
     window = ti.ui.Window("bench", (MR.WIDTH, MR.HEIGHT), show_window=False)
     canvas = window.get_canvas()
     print(f"device={E.DEVICE} grid={E.GRID_W}x{E.GRID_H} view={MR.VIEW_W}x{MR.VIEW_H} zoom={args.zoom} "
-          f"field={args.field} solver={args.solver} sort_interval={E.CONFIG['simulation'].get('SORT_INTERVAL')}")
+          f"field={args.field} solver={args.solver} sort_interval={E.CONFIG['simulation'].get('SORT_INTERVAL')} "
+          f"boundary={args.boundary or 'default'} potential={args.potential} range={args.force_range or 'default'}")
     for c in args.counts:
         cap = min(E.MAX_PARTICLES, E.NBODY_MAX_PARTICLES) if args.solver == "nbody" else E.MAX_PARTICLES
         n = min(int(float(c)), cap)
         frames = args.frames or (100 if n <= 2_000_000 else 60)
-        step, render, eng = bench(n, frames, canvas, args.zoom, args.field, args.solver)
+        step, render, eng = bench(n, frames, canvas, args.zoom, args.field, args.solver, args.boundary,
+                                  args.potential, args.force_range)
         total = step + render
         print(f"{n:>9,d}  kernels={eng.kernels.name:6s}  step {step:6.2f} ms + render {render:5.2f} ms "
               f"= {total:6.2f} ms (~{1000/total:5.1f} FPS)")

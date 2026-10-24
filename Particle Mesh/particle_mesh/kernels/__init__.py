@@ -51,8 +51,10 @@ def nbody_accel(pos, masses, kind_id, strength, spring_k_over_n, epsilon, sigma,
     p = pos.contiguous() if shared else pos.to('cpu').contiguous()
     m = masses.contiguous() if shared else masses.to('cpu').contiguous()
     acc = torch.empty((N, 2), dtype=torch.float32, device=p.device)
-    KTI.nbody_accel_kernel(p, m, acc, N, kind_id, strength, spring_k_over_n, epsilon, sigma, soft2, inv_range,
-                           periodic, universe_w, universe_h)
+    # kind, periodic and screened select a specialised kernel (Taichi template arguments, each compiled once)
+    KTI.nbody_accel_kernel(p, m, acc, N, int(kind_id), strength, spring_k_over_n, epsilon, sigma, soft2, inv_range,
+                           int(bool(periodic)), int(inv_range > 0.0), universe_w, universe_h,
+                           1.0 / universe_w, 1.0 / universe_h)
     if not shared:
         acc = acc.to(pos.device)
     return acc[:, 0], acc[:, 1]

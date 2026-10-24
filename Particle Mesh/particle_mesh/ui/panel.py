@@ -3,6 +3,8 @@ import glob
 from particle_mesh.ui.image_loader import browse_custom_image, load_image_particles
 
 IMAGE_PATTERNS = ('*.png', '*.jpg', '*.jpeg', '*.tif', '*.tiff')
+# Zoom factor of the panel's Zoom In / Zoom Out buttons
+PANEL_ZOOM_STEP = 1.5
 
 
 def scan_images():
@@ -47,6 +49,24 @@ class SimulationGUI:
         """[min, max] of a slider from config.json (fallback when the entry is missing)."""
         spec = self.config["sliders"].get(name)
         return (spec[0], spec[1]) if spec else fallback
+
+    def _scene_centre(self):
+        """Screen pixel at the centre of the scene area, right of the panel (the panel is open while it draws)."""
+        return (self.ui_w + (1.0 - self.ui_w) / 2.0) * self.camera.width, self.camera.height / 2.0
+
+    def _zoom_controls(self, gui):
+        """Zoom slider (log2 of the zoom, between the camera's limits) and Zoom In / Zoom Out buttons, all about the
+        centre of the scene area."""
+        cam = self.camera
+        log_zoom = math.log2(cam.zoom)
+        new_log = gui.slider_float("Zoom (log2)", log_zoom, math.log2(cam.min_zoom), math.log2(cam.max_zoom))
+        # ImGui hands back a float32: only act on a real change, so an untouched slider never drifts the camera
+        if abs(new_log - log_zoom) > 1e-4:
+            cam.zoom_around_mouse(*self._scene_centre(), 2.0 ** new_log / cam.zoom)
+        if gui.button("Zoom In"):
+            cam.zoom_around_mouse(*self._scene_centre(), PANEL_ZOOM_STEP)
+        if gui.button("Zoom Out"):
+            cam.zoom_around_mouse(*self._scene_centre(), 1.0 / PANEL_ZOOM_STEP)
 
     def _spawn_image(self, path, spawn_density):
         rcs = self.config["simulation"]["RENDER_CELL_SIZE"]
@@ -106,6 +126,7 @@ class SimulationGUI:
         gui.text(f"Theme: {self.palettes.names[self.engine.color_theme]}")
         if gui.button("Next Color Theme"):
             self.engine.color_theme = self.palettes.cycle(self.engine.color_theme)
+        self._zoom_controls(gui)
             
         # --- Advanced View Settings (PM Mode only) ---
         if self.engine.solver_type == 'pm':
@@ -135,8 +156,7 @@ class SimulationGUI:
                 self.engine.gamma = gui.slider_float("Poly Index (Gamma)", self.engine.gamma, self.config["sliders"]["polytropic_gamma"][0], self.config["sliders"]["polytropic_gamma"][1])
             
         # Boundary selector
-        bound_text = {'open': "OPEN (PARTICLES LEAVE)", 'periodic': "UNIVERSE WRAPPED",
-                      'reflective_walls': "SOLID WALL BOUNCE"}[self.engine.boundary_mode]
+        bound_text = {'open': "OPEN (PARTICLES LEAVE)", 'periodic': "UNIVERSE WRAPPED"}[self.engine.boundary_mode]
         if gui.button(f"Boundary: {bound_text}"):
             self.engine.toggle_boundary()
                 
@@ -244,7 +264,7 @@ class SimulationGUI:
         gui.text("--- CONTROL HOTKEYS ---")
         gui.text("LMB: Spawn | RMB: Delete")
         gui.text("Space+LMB / MMB Drag: Pan View")
-        gui.text("Ctrl+LMB Drag or Up/Down: Zoom")
+        gui.text("Wheel, Ctrl+LMB Drag or Up/Down: Zoom")
         gui.text("Ctrl+RMB Drag: Brush Size")
         if self.engine.solver_type == 'pm':
             gui.text("P: Toggle Potential View")

@@ -367,3 +367,34 @@ A read-only multi-agent sweep produced these findings. Each one was then checked
 | F14–F16, F25, F26, F29–F31, F37–F40, F42–F46, F49, F50, R1–R6 | Time-based or rolling sorts, erase fast path, batched iFFTs, real LJ kernels, `inference_mode`, ImGui trims, XPUGraphs, circle VBO, cap/workspace/chunking changes, CUDA texture present, Taichi fusions and atomics, spectral forces, NGP, a Vulkan particle backend, frame pacing | various | refuted: negligible, slower, or infeasible | Rejected |
 
 The critic's main idea, moving particles into Taichi Vulkan ndarrays on the laptop, was rejected. Each step would hand 2 × 16 MB grids across through the host, costing ~12–18 ms per step (§5.3), which outweighs the 4–6× faster particle kernels at the default 1M particles.
+
+---
+
+## 9. Physics/FFT recheck, zoom and boundary cleanup (2026-10-24)
+
+A read-only recheck of `physics/` and the kernels against `master` after PR #13, then implemented on branch `feat/zoom-wheel-cleanup`. PR #13 had already fixed the spring sign flip beyond 2·range, the hollow PM Lennard-Jones core (PM kernels are now integrated from the clamped N-body force), the hidden N-body LJ `vel *= 0.99`, and the N-body LJ sign. Measured on the RTX 5090 desktop (CUDA, Taichi kernels), back to back against a `master` worktree, 3 alternating pairs each.
+
+| ID | Finding / change | Where | Measured | Status |
+|---|---|---|---|---|
+| A1 | Periodic gravity/Coulomb with a finite force range used the analytic Yukawa kernel `1/(k² + 1/range²)`, whose force `(r/range)·K₁(r/range)/r` is not N-body's `exp(-r/range)/r`: ~23% stronger at 0.4·range, ~39% at the range. The parity tests only ran unscreened. Now only unscreened periodic gravity/Coulomb use the analytic kernel; screened ones sample the N-body law like every other kernel. | `potentials.uses_analytic_kernel` | PM matches the law within 5% at 30–200 cells, range 300 and 1000 (`test_screened_periodic_pm_matches_nbody`; all 8 cases fail on `master`); step cost unchanged | Done |
+| A5 | `sample_forces` (spawn orbit speeds) used `padding_mode='border'` on the unpadded grid, so within half a cell of the edge it replicated instead of wrapping in periodic mode. It now samples a one-cell padded copy (circular when periodic, replicate when open) with the CIC stencil's coordinates, i.e. exactly the gather. | `pm_solver.sample_forces` | `test_sample_forces_matches_the_cic_gather_at_the_edge` | Done |
+| R1 | Every Fourier kernel is now real float32. The sampled kernels are FFTs of an even grid (minimum-image offsets), so the imaginary part is rounding noise (≤1.4e-7 of the real part, measured for all kinds, periodic and isolated); only `.real` is kept. | `potentials._sampled_kernel` | half the kernel memory (e.g. 4096×2049 isolated: 67 → 34 MB); real × complex multiply | Done |
+| B1 | The central difference's 1/(2·dx) was two full-grid `mul_` passes per step. It's folded into the cached `K_eff` (the solver keeps `phi_scaled = phi/(2·dx)`; `phi` is a property; the potential view rescales the viewport) and into the pressure's 1/ρ scale. | `pm_solver`, `grid_ops.neg_gradient(prescaled=)` | micro: neg_gradient 1.67 → 0.76 ms on 8192², 0.066 → 0.055 ms on 2048² | Done |
+| B2 | Harmonic mean-field 1/N was a complex half-grid multiply every step. It now rides in `K_eff` (cache key includes N, so it rebuilds only when N changes). | `pm_solver._compute_field` | micro: 0.38 ms/step on 8192², 0.011 on 2048² | Done |
+| B3 | Sort tiles were capped at 16 cells, so 8192² grids got int32 keys (262k tiles). The cap is now 32, keeping int16 keys (65,536 tiles). | `engine.__init__` | argsort at 4M: int32 0.225 → int16 0.125 ms | Done |
+| B4 | Hand `rfft2` the deposit's padded interior instead of copying it into `density_grid`. | torch backend | rejected: an rfft2 of the strided view (1.34 ms on 8192²) costs the same as copy + contiguous rfft2 (0.38 + 0.97 ms) | Rejected |
+| B5 | N-body Taichi kernel: potential kind, periodic and screened are `ti.template()` arguments (one branch-free kernel per combination, no `exp` when unscreened), one `rsqrt` instead of a `sqrt` and per-pair divisions, minimum image by multiplication. | `taichi_impl.nbody_accel_kernel` | 25k step: unscreened open 5.05 → 1.92 ms (2.6×), screened periodic 5.03 → 2.41 ms (2.1×) | Done |
+| — | Reflective walls removed (the user's request): `BOUNDARY_MODES = ('open', 'periodic')`. | `engine` | — | Done |
+
+PM frames on the shipped 2048² config (`bench_frame.py`, step + render, ms): open 1M 1.29–1.32 + ~3.2 → 1.28–1.41 + ~3.3, periodic 1M 0.96–1.01 → 0.91–0.95, periodic 4M 1.01–1.15 → 0.98–1.08. At 2048² on the 5090 the PM changes are within noise or a few percent; their gains show on large grids and slow memory (8192² below; the B390's ~10× lower bandwidth).
+
+8192² (desktop-style config: cell 1, 3840×2160, `MAX_PARTICLES` 16M, temporary `config.json`), engine step in ms, `master` → branch, 3 pairs each (render unchanged, ~4.2–5.0 ms):
+
+| Case | `master` | Branch | Change |
+|---|---|---|---|
+| periodic gravity, 4M | 5.53–5.55 | 4.85–4.91 | −12% |
+| periodic gravity, 16M | 6.32–6.41 | 5.75–5.76 | −9% |
+| open gravity (16384² isolated FFT), 4M | 14.22–14.24 | 13.59–13.66 | −4% |
+| periodic springs, 4M | 5.96–6.01 | 4.87–4.91 | −18% |
+
+Not changed: A6 (CIC window deconvolution in `K_eff`; optional, not requested) and range-aware isolated padding (only saves time with screening on, and screening is now off by default).

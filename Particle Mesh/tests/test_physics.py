@@ -117,18 +117,6 @@ def test_periodic_attraction_across_edge(make_engine, centre, solver):
     assert vl < 0 < vr          # pulled toward each other through the x boundary
 
 
-def test_reflective_walls_bounce(make_engine, centre):
-    eng = make_engine(1, boundary='reflective_walls')
-    eng.G = 1e-6
-    eng.precompute_kernel()
-    eng.friction = 0.0
-    eng.pos[0] = torch.tensor([UW + 5.0, centre[1]])
-    eng.vel[0] = torch.tensor([10.0, 0.0])
-    eng.step(0.001)
-    assert eng.vel[0, 0].item() < 0
-    assert eng.pos[0, 0].item() <= UW
-
-
 def test_sorting_preserves_physics(make_engine):
     a = make_engine(200000)
     b = make_engine(0)

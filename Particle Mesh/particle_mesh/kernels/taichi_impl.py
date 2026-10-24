@@ -15,7 +15,8 @@ def _cic_corners(px, py, cell_size, grid_w, grid_h, periodic):
     x = px / cell_size - 0.5
     y = py / cell_size - 0.5
     if periodic == 0:
-        # Clamped CIC (reflective walls): identical to the torch backend's edge-replicated halo
+        # Clamped CIC (open boundary, isolated solve on the unpadded mesh): identical to the torch backend's
+        # edge-replicated halo
         x = ti.max(0.0, ti.min(x, grid_w - 1.0))
         y = ti.max(0.0, ti.min(y, grid_h - 1.0))
     fx = ti.floor(x)
@@ -98,13 +99,16 @@ def gather_integrate_kernel(
 @ti.kernel
 def nbody_accel_kernel(
     pos: ti.types.ndarray(), mass: ti.types.ndarray(), acc: ti.types.ndarray(), num_active: ti.i32,
-    kind: ti.i32, strength: ti.f32, spring_k_over_n: ti.f32, epsilon: ti.f32, sigma: ti.f32,
-    soft2: ti.f32, inv_range: ti.f32, periodic: ti.i32, universe_w: ti.f32, universe_h: ti.f32
+    kind: ti.template(), strength: ti.f32, spring_k_over_n: ti.f32, epsilon: ti.f32, sigma: ti.f32,
+    soft2: ti.f32, inv_range: ti.f32, periodic: ti.template(), screened: ti.template(),
+    universe_w: ti.f32, universe_h: ti.f32, inv_universe_w: ti.f32, inv_universe_h: ti.f32
 ):
     """
     Exact pairwise accelerations, one thread per target particle, same force laws as nbody_solver's torch path
     (kind: 0 gravity, 1 Coulomb, 2 harmonic, 3 Lennard-Jones). Fused: no N x N temporaries at all.
     The self term needs no special case: its displacement is exactly 0 and every force is softened/clamped.
+    kind, periodic and screened (inv_range > 0) are compile-time constants: one specialised kernel per
+    combination, with no per-pair branches, no exp when unscreened (the default), one rsqrt and no divisions.
     """
     for i in range(num_active):
         xi = pos[i, 0]
@@ -114,30 +118,32 @@ def nbody_accel_kernel(
         for j in range(num_active):
             dx = pos[j, 0] - xi
             dy = pos[j, 1] - yi
-            if periodic != 0:
+            if ti.static(periodic):
                 # minimum image
-                dx -= universe_w * ti.floor(dx / universe_w + 0.5)
-                dy -= universe_h * ti.floor(dy / universe_h + 0.5)
+                dx -= universe_w * ti.floor(dx * inv_universe_w + 0.5)
+                dy -= universe_h * ti.floor(dy * inv_universe_h + 0.5)
             r2 = dx * dx + dy * dy + soft2
-            r = ti.sqrt(r2)
-            screen = ti.exp(-r * inv_range)
+            inv_r = ti.rsqrt(r2)
+            screen = 1.0
+            if ti.static(screened):
+                screen = ti.exp(-(r2 * inv_r) * inv_range)
             mj = ti.cast(mass[j], ti.f32)
             f = 0.0
-            if kind == 0:
-                f = strength * mj * screen / r2
-            elif kind == 1:
-                f = -strength * mj * screen / r2
-            elif kind == 2:
+            if ti.static(kind == 0):
+                f = strength * mj * screen * inv_r * inv_r
+            elif ti.static(kind == 1):
+                f = -strength * mj * screen * inv_r * inv_r
+            elif ti.static(kind == 2):
                 f = spring_k_over_n * mj * screen
             else:
-                s = sigma / r
+                s = sigma * inv_r
                 s6 = s * s * s * s * s * s
                 # Repulsive -dV/dr (clamped): pushes the target away from the source, along -(dx, dy)
-                force_mag = ti.min(ti.max(24.0 * epsilon / r * (2.0 * s6 * s6 - s6), -500000.0), 500000.0)
-                f = -force_mag / r * mj * screen
+                force_mag = ti.min(ti.max(24.0 * epsilon * inv_r * (2.0 * s6 * s6 - s6), -500000.0), 500000.0)
+                f = -force_mag * inv_r * mj * screen
             ax += f * dx
             ay += f * dy
-        if kind == 1:
+        if ti.static(kind == 1):
             q = ti.cast(mass[i], ti.f32)
             ax *= q
             ay *= q

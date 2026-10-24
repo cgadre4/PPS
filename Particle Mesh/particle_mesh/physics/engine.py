@@ -28,9 +28,9 @@ KERNEL_REBUILD_DELAY = 0.15
 POTENTIALS = ('gravity', 'lennard_jones', 'harmonic', 'coulomb')
 PRESSURE_MODELS = ('none', 'isothermal', 'polytropic')
 # 'open': particles that leave the physics mesh are deleted, and forces come from an isolated (zero-padded)
-# field solve with no periodic images. 'periodic': a wrapped torus. 'reflective_walls': bounce at the mesh edge
-# (isolated solve). toggle_boundary() cycles in this order.
-BOUNDARY_MODES = ('open', 'periodic', 'reflective_walls')
+# field solve with no periodic images. 'periodic': a wrapped torus. toggle_boundary() switches between them.
+# (Reflective walls were removed: particles past the mesh edge leave the simulation instead of bouncing.)
+BOUNDARY_MODES = ('open', 'periodic')
 # The force-range slider's maximum means "no screening": the pure 2D law |a| = G * m / r
 FORCE_RANGE_OFF = SETTINGS.slider("gravity_range")[1]
 
@@ -122,10 +122,11 @@ class SimulationEngine:
         # Applied inside step() from that step's own field, so spawning needs no second solve (AUDIT §8 F04).
         self._pending_orbits = []
         # Sort keys: index of the t x t-cell tile holding each particle. The finest tile whose count fits int16
-        # (8x8 cells on 2048^2); int16 argsort is ~1.7x faster than float cell keys (AUDIT §8 F13).
+        # (8x8 cells on 2048^2, 32x32 on 8192^2); int16 argsort is ~1.7x faster than float cell keys (AUDIT §8
+        # F13) and ~2x faster than int32 (AUDIT §9 B3).
         self._sort_tile = 1
         while (math.ceil(GRID_W / self._sort_tile) * math.ceil(GRID_H / self._sort_tile) > 65536
-               and self._sort_tile < 16):
+               and self._sort_tile < 32):
             self._sort_tile *= 2
         self._sort_tiles_x = math.ceil(GRID_W / self._sort_tile)
         self._sort_tiles_y = math.ceil(GRID_H / self._sort_tile)
@@ -204,21 +205,15 @@ class SimulationEngine:
         self.pressure_model = model
 
     def toggle_boundary(self):
-        """Cycle open -> periodic (wrapped) -> reflective walls. The PM kernel follows on the next solve."""
+        """Switch open <-> periodic (wrapped). The PM kernel follows on the next solve."""
         i = BOUNDARY_MODES.index(self.boundary_mode)
         self.boundary_mode = BOUNDARY_MODES[(i + 1) % len(BOUNDARY_MODES)]
         self._field_dirty = True
-        # Apply the new boundary right away: particles may sit just outside the mesh (walls clamp at the start of
-        # a step, so a drift can leave them past the edge until the next one)
-        n = self.num_active
+        # Apply the new boundary right away, so no particle is ever left outside the mesh for a frame
         if self.boundary_mode == 'open':
             self._drop_outside()
-        elif self.boundary_mode == 'periodic':
-            self.kernels.wrap(self.pos, n, self.universe_w, self.universe_h)
         else:
-            size = const_tensor((float(self.universe_w), float(self.universe_h)), self.device, self.pos.dtype)
-            self.pos[:n].clamp_(min=0.0)
-            torch.minimum(self.pos[:n], size, out=self.pos[:n])
+            self.kernels.wrap(self.pos, self.num_active, self.universe_w, self.universe_h)
 
     def _inside(self, p):
         """Bool mask of the (M, 2) positions inside the physics mesh [0, universe)."""
@@ -290,7 +285,8 @@ class SimulationEngine:
             self.pm_solver.accelerations_at(self.pos, self.masses, n, s0, e0, 'gravity', params,
                                             self.periodic, self.universe_w, self.universe_h)
             self._apply_pending_orbits(
-                lambda s, e: self.pm_solver.sample_forces(self.pos[s:e], self.universe_w, self.universe_h))
+                lambda s, e: self.pm_solver.sample_forces(self.pos[s:e], self.universe_w, self.universe_h,
+                                                          self.periodic))
 
     def _set_orbital_velocities(self, start, end, world_x, world_y, vel_mult, ax, ay):
         """
@@ -409,16 +405,8 @@ class SimulationEngine:
             return
 
         n = self.num_active
-        # 1. Handle Boundaries. Periodic needs nothing here: positions are wrapped right after each drift.
-        # Open deletes escaped particles after the drift (step 3).
-        if self.boundary_mode == 'reflective_walls':
-            p = self.pos[:n]
-            v = self.vel[:n]
-            size = const_tensor((float(self.universe_w), float(self.universe_h)), self.device, p.dtype)
-            hit = (p < 0) | (p > size)
-            v.mul_(torch.where(hit, -0.5, 1.0))     # bounce with half restitution
-            p.clamp_(min=0.0)
-            torch.minimum(p, size, out=p)
+        # 1. Boundaries: periodic positions are wrapped right after each drift; open deletes escaped particles
+        # after the drift (step 3). Nothing to do before the solve.
 
         # Uniform background gravity, folded into the kick of either solver
         uniform = (0.0, 0.0)
@@ -455,7 +443,8 @@ class SimulationEngine:
             hook = None
             if self._pending_orbits:
                 hook = lambda solver: self._apply_pending_orbits(
-                    lambda s, e: solver.sample_forces(self.pos[s:e], self.universe_w, self.universe_h))
+                    lambda s, e: solver.sample_forces(self.pos[s:e], self.universe_w, self.universe_h,
+                                                      self.periodic))
             self.pm_solver.solve(
                 self.pos,
                 self.vel,

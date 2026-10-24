@@ -131,6 +131,24 @@ APP = build()
 ENG, CAM, WIN, GUI = APP.engine, APP.camera, APP.window, APP.imgui
 
 
+class ScriptedWheel:
+    """Mouse wheel for the script (the offscreen window has no Windows message loop to hook)."""
+
+    def __init__(self):
+        self.pending = 0.0
+
+    def add(self, notches):
+        self.pending += notches
+
+    def take(self):
+        n, self.pending = self.pending, 0.0
+        return n
+
+
+WHEEL = ScriptedWheel()
+APP.controller.wheel = WHEEL.take
+
+
 def _sync_sections():
     """ACTIONS_SYNC=1: synchronise and time each frame section, so an asynchronous GPU failure is attributed to
     the section that caused it, and slow sections are reported."""
@@ -325,6 +343,28 @@ if PM:
 frame_ok("max zoom frame")
 step("reset button", 1, press={"Reset View"})
 
+# --- mouse wheel (towards the cursor, both limits, ignored over the panel) and the panel's zoom controls
+step("wheel in", 1, cursor=SCENE, call=lambda: WHEEL.add(3))
+if not CAM.zoom > 1.0:
+    FAILURES.append(f"wheel in: zoom {CAM.zoom} did not grow")
+step("wheel out to the limit", 1, cursor=SCENE, call=lambda: WHEEL.add(-200))
+step("spawn after wheel out", FRAMES, held={LMB}, cursor=SCENE)
+step("wheel in to the limit", 1, cursor=SCENE, call=lambda: WHEEL.add(500))
+step("erase after wheel in", FRAMES, held={RMB}, cursor=SCENE)
+step("reset R", 1, held={'r'})
+release()
+_z = CAM.zoom
+step("wheel over the panel", 1, cursor=(0.05, 0.5), call=lambda: WHEEL.add(5))
+if CAM.zoom != _z:
+    FAILURES.append("wheel over the panel zoomed the view")
+step("zoom slider min", 2, sliders={"Zoom (log2)": "min"})
+step("zoom slider max", 2, sliders={"Zoom (log2)": "max"})
+step("spawn at slider max zoom", FRAMES, held={LMB}, cursor=SCENE)
+step("zoom slider 1x", 1, sliders={"Zoom (log2)": 0.0})
+step("zoom in button", 1, press={"Zoom In"})
+step("zoom out button", 1, press={"Zoom Out"})
+step("reset button again", 1, press={"Reset View"})
+
 # --- panning far away (Space+LMB and MMB), act off the mesh, come back
 for k in range(6):
     drag(f"pan space {k}", {SPACE, LMB}, (0.9, 0.9), (0.2, 0.1))
@@ -390,7 +430,7 @@ def wait_rebuild(label):
 
 for kind, button in POTENTIAL_BUTTONS.items():
     step(f"potential {kind}", FRAMES, press={button})
-    for b in range(3):
+    for b in range(len(E.BOUNDARY_MODES)):
         step(f"{kind}: boundary {ENG.boundary_mode}", FRAMES, held={LMB}, cursor=SCENE)
         step(f"{kind}: erase in {ENG.boundary_mode}", 1, held={RMB}, cursor=SCENE)
         step(f"{kind}: next boundary", 1, press={GUI.boundary_label})
@@ -423,7 +463,7 @@ step("worst case", 1, press={"Force: Gravity"}, sliders={
     "Force Softening Length": "min", "Force Range": "min"})
 wait_rebuild("worst case (rebuilt)")
 step("worst case + spawn", 3 * FRAMES, held={LMB}, cursor=SCENE)
-for b in range(3):
+for b in range(len(E.BOUNDARY_MODES)):
     step(f"worst case boundary {ENG.boundary_mode}", 2 * FRAMES)
     step("worst case next boundary", 1, press={GUI.boundary_label})
 step("worst case at min zoom", 1, call=lambda: CAM.zoom_around_mouse(0, 0, 1e-9))

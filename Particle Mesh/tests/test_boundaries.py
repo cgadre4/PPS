@@ -57,19 +57,31 @@ def test_open_boundary_deletes_escaped_particles(make_engine):
 
 
 def test_switching_boundary_applies_immediately(make_engine):
-    """Walls clamp at the start of a step, so particles can sit past the edge after the drift; switching to open
-    must not leave them there (nor periodic leave them unwrapped)."""
-    eng = make_engine(3, boundary='reflective_walls')
+    """Switching to open drops particles outside the mesh at once; switching to periodic wraps them at once."""
+    eng = make_engine(3, boundary='periodic')
     eng.pos[:3] = torch.tensor([[E.UNIVERSE_W + 5.0, CY], [E.UNIVERSE_W / 2, CY], [-3.0, CY]])
-    eng.toggle_boundary()                                           # walls -> open
+    eng.toggle_boundary()                                           # periodic -> open
     assert eng.boundary_mode == 'open' and eng.num_active == 1
     eng.pos[1] = torch.tensor([E.UNIVERSE_W + 5.0, CY])
     eng.num_active = 2
     eng.toggle_boundary()                                           # open -> periodic
+    assert eng.boundary_mode == 'periodic'
     assert eng.pos[1, 0].item() == pytest.approx(5.0, abs=1e-3)
-    eng.pos[1] = torch.tensor([-7.0, CY])
-    eng.toggle_boundary()                                           # periodic -> walls
-    assert eng.pos[1, 0].item() == 0.0
+
+
+def test_reflective_walls_are_gone(make_engine):
+    """Wall reflection was removed: the only modes are open (particles leave) and periodic."""
+    assert E.BOUNDARY_MODES == ('open', 'periodic')
+    eng = make_engine(1, boundary='open')
+    eng.G = 1e-6
+    eng.friction = 0.0
+    eng.precompute_kernel()
+    eng.pos[0] = torch.tensor([E.UNIVERSE_W - 1.0, CY])
+    eng.vel[0] = torch.tensor([600.0, 0.0])
+    eng.step(1.0 / 120.0)
+    assert eng.num_active == 0                                      # no bounce: it left the simulation
+    with pytest.raises(AssertionError):
+        make_engine(1, boundary='reflective_walls')
 
 
 def test_open_spawn_outside_the_mesh_is_dropped(make_engine):
@@ -79,11 +91,10 @@ def test_open_spawn_outside_the_mesh_is_dropped(make_engine):
     assert bool((eng.pos[:eng.num_active, 0] >= 0).all())
 
 
-@pytest.mark.parametrize("boundary", ["open", "reflective_walls"])
-def test_isolated_solve_has_no_periodic_images(make_engine, boundary):
+def test_isolated_solve_has_no_periodic_images(make_engine):
     """Two particles near opposite edges attract across the mesh (periodic would pull them through the edge)."""
     x0, x1 = 100.0 + CS / 2, E.UNIVERSE_W - 100.0 + CS / 2
-    a = _pair_accel(make_engine, 'pm', 'gravity', x0, x1, boundary)
+    a = _pair_accel(make_engine, 'pm', 'gravity', x0, x1, 'open')
     assert a > 0
     assert a == pytest.approx(1.0 / (x1 - x0), rel=0.05)         # free-space |a| = G m / r
     a_periodic = _pair_accel(make_engine, 'pm', 'gravity', x0, x1, 'periodic')
@@ -141,3 +152,51 @@ def test_force_range_at_max_means_no_screening(make_engine):
     assert eng._physics_params()['force_range'] == math.inf
     eng.gravity_range = 100.0
     assert eng._physics_params()['force_range'] == 100.0
+
+
+@pytest.mark.parametrize("potential", ["gravity", "coulomb"])
+@pytest.mark.parametrize("sep_cells,force_range", [(30, 300.0), (60, 300.0), (200, 300.0), (20, 1000.0)])
+def test_screened_periodic_pm_matches_nbody(make_engine, potential, sep_cells, force_range):
+    """Periodic gravity/Coulomb with a finite force range use the N-body law exp(-r/range) / r. They used to use the
+    Yukawa Fourier kernel, whose force differs by ~23% at 0.4 x range and ~39% at the range."""
+    cx = E.UNIVERSE_W / 2.0 + CS / 2
+    sep = sep_cells * CS
+    x0, x1 = cx - sep / 2, cx + sep / 2
+    a_pm = _pair_accel(make_engine, "pm", potential, x0, x1, "periodic", force_range)
+    a_nb = _pair_accel(make_engine, "nbody", potential, x0, x1, "periodic", force_range)
+    expected = _law(potential, sep, force_range)
+    assert a_nb == pytest.approx(expected, rel=1e-3)
+    assert a_pm == pytest.approx(expected, rel=0.05)
+
+
+def test_unscreened_periodic_gravity_keeps_the_exact_fourier_kernel(make_engine):
+    from particle_mesh.physics.potentials import uses_analytic_kernel
+    assert uses_analytic_kernel('gravity', False, math.inf) and uses_analytic_kernel('coulomb', False, math.inf)
+    assert not uses_analytic_kernel('gravity', False, 300.0)       # screened: sampled N-body law
+    assert not uses_analytic_kernel('gravity', True, math.inf)     # isolated: sampled free-space kernel
+    eng = make_engine(0, boundary='periodic')
+    eng.gravity_range = E.FORCE_RANGE_OFF
+    eng.precompute_kernel()
+    k_sq = eng.pot_manager.k_sq
+    expected = -2 * math.pi * eng.G / CS ** 2 / k_sq[0, 1]          # -2 pi G / (k^2 cell^2)
+    assert eng.pm_solver.K_k[0, 1].item() == pytest.approx(expected.item(), rel=1e-5)
+
+
+@pytest.mark.parametrize("periodic", [True, False], ids=["periodic", "open"])
+def test_sample_forces_matches_the_cic_gather_at_the_edge(make_engine, periodic):
+    """Spawn orbit speeds sample the field like the gather does: wrapped across the edge when periodic (it used to
+    replicate the edge cell), clamped when open."""
+    eng = make_engine(0, boundary='periodic' if periodic else 'open')
+    solver = eng.pm_solver
+    w = solver.grid_w
+    cols = torch.arange(w, device=eng.device)
+    solver.fx.copy_((cols == w - 1).float().expand(solver.grid_h, w))   # fx = 1 in the last column only, fy = 0
+    solver.fy.zero_()
+    x = torch.tensor([[0.1 * CS, CY], [(w - 0.2) * CS, CY], [5.5 * CS, CY]], device=eng.device)
+    ax, ay = solver.sample_forces(x, E.UNIVERSE_W, E.UNIVERSE_H, periodic)
+    # 0.1 cell from the left edge: weight 0.4 on cell w-1 (wrapped) and 0.6 on cell 0 ...
+    left = 0.4 if periodic else 0.0
+    # ... 0.2 cell from the right edge: weight 0.7 on cell w-1 and 0.3 on cell 0 (wrapped)
+    right = 0.7 if periodic else 1.0
+    assert ax.tolist() == pytest.approx([left, right, 0.0], abs=1e-3)
+    assert ay.abs().max().item() == 0.0

@@ -39,7 +39,7 @@ def test_render_nbody_passes_main_arguments(make_engine, circles, monkeypatch):
     circles.render_nbody("canvas", eng, Cam, cmap)
     (canvas, pos, colors, n, cx, cy, sw, sh, radius), = calls
     assert canvas == "canvas" and n == 100 and pos.shape == (100, 2) and colors.shape == (100, 3)
-    assert (cx, cy, sw, sh, radius) == (10.0, 20.0, 400.0, 300.0, 0.0005)
+    assert (cx, cy, sw, sh, radius) == (10.0, 20.0, 400.0, 300.0, 0.001)     # dots grow with zoom (2x)
     eng.num_active = 0
     circles.render_nbody("canvas", eng, Cam, cmap)
     assert len(calls) == 1

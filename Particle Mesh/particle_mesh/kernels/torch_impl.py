@@ -11,7 +11,7 @@ Cloud-in-cell (CIC) assignment and interpolation use PyTorch's fused bilinear sa
   - deposit = aten::grid_sampler_2d_backward with the particle masses as the incoming gradient, which scatters
               each mass to the 4 surrounding cells with the same bilinear weights, i.e. exactly CIC assignment.
 Both work on a one-cell-padded grid (H+2, W+2): for periodic boundaries the halo wraps (deposit folds it back,
-gather sees wrapped copies); for reflective walls it replicates the edge, which equals the clamped CIC.
+gather sees wrapped copies); for the open boundary it replicates the edge, which equals the clamped CIC.
 Measured on the Arc B390: stencil + deposit + gather 6.5 -> 1.9 ms at 1M particles, 24.6 -> 6.3 ms at 4M.
 
 Grid layout: physics grids are (H, W) row-major, indexed [j, i]; flat index = j * W + i.
@@ -56,7 +56,7 @@ def cic_stencil(pos, num_active, cell_size, grid_w, grid_h, periodic):
 
 def _fold_halo(padded, periodic):
     """Fold the one-cell halo of a deposited (H+2, W+2) grid back onto the interior: wrapped (periodic) or onto
-    the edge cells (reflective walls, i.e. clamped CIC). Rows first (full width), then columns, so corners land
+    the edge cells (open boundary, i.e. clamped CIC). Rows first (full width), then columns, so corners land
     correctly. Returns the (H, W) interior view."""
     h, w = padded.shape[0] - 2, padded.shape[1] - 2
     if periodic:
