@@ -9,16 +9,16 @@ from particle_mesh.physics.nbody_solver import DirectNBodySolver
 
 
 def test_kernels_are_half_spectrum_and_real_where_possible(make_engine):
-    """AUDIT 3.1: kernels live in rfft2 layout; gravity/Coulomb are real (no full complex grid)."""
+    """AUDIT 3.1: kernels live in rfft2 layout, and all of them are real: the analytic ones by construction, the
+    sampled ones because the minimum-image sample grid is even (AUDIT §9)."""
+    import math
     eng = make_engine()
     H, W = E.GRID_H, E.GRID_W
-    params = dict(G=1.0, force_range=100.0, spring_k=0.1, epsilon=1000.0, sigma=40.0)
-    for potential in ('gravity', 'coulomb'):
-        K = eng.pot_manager.get_fourier_kernel(potential, params)
-        assert K.shape == (H, W // 2 + 1) and not K.is_complex()
-    for potential in ('harmonic', 'lennard_jones'):
-        K = eng.pot_manager.get_fourier_kernel(potential, params)
-        assert K.shape == (H, W // 2 + 1) and K.is_complex()
+    for force_range in (100.0, math.inf):
+        params = dict(G=1.0, force_range=force_range, spring_k=0.1, epsilon=1000.0, sigma=40.0)
+        for potential in ('gravity', 'coulomb', 'harmonic', 'lennard_jones'):
+            K = eng.pot_manager.get_fourier_kernel(potential, params)
+            assert K.shape == (H, W // 2 + 1) and not K.is_complex() and K.dtype == torch.float32
     assert eng.pm_solver.k_sq is eng.pot_manager.k_sq                  # shared, not duplicated
     assert not hasattr(eng.pot_manager, 'kx_grid') and not hasattr(eng.pot_manager, 'r')
 

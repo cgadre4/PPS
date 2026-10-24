@@ -20,6 +20,7 @@ from particle_mesh.settings import CONFIG, SETTINGS
 from particle_mesh.ui.input import InputController
 from particle_mesh.ui.panel import SimulationGUI
 from particle_mesh.ui.state import Controls
+from particle_mesh.ui.wheel import attach_wheel
 
 WINDOW_TITLE = "PyTorch + Taichi Flexible Physical Sandbox"
 BACKGROUND = (0.02, 0.02, 0.03)
@@ -110,6 +111,8 @@ def build_app(solver=None, window_factory=None, engine_factory=None, settings=SE
     window_factory = window_factory or ti.ui.Window
     engine_factory = engine_factory or SimulationEngine
     window = window_factory(WINDOW_TITLE, (settings.width, settings.height), vsync=False, pos=(0, 0))
+    # Mouse wheel from the Windows message loop (GGUI has none); None elsewhere or if the window isn't found
+    wheel = attach_wheel(WINDOW_TITLE)
     brush = BrushOverlay()
 
     # Startup count and solver from the configuration (the engine caps N-body startup counts)
@@ -125,9 +128,12 @@ def build_app(solver=None, window_factory=None, engine_factory=None, settings=SE
     # Brush, spawn, time-scale and panel state shared by input handling and the panel
     controls = Controls.from_settings(settings)
     panel = SimulationGUI(engine, camera, CONFIG, palettes, controls)
-    controller = InputController(window, camera, settings.width, settings.height, settings.slider("brush_radius")[:2])
-    return App(window, engine, camera, palettes, controls, controller, panel, brush, circle_renderer, mesh_renderer,
-               settings)
+    controller = InputController(window, camera, settings.width, settings.height, settings.slider("brush_radius")[:2],
+                                 wheel=wheel.take if wheel is not None else None)
+    app = App(window, engine, camera, palettes, controls, controller, panel, brush, circle_renderer, mesh_renderer,
+              settings)
+    app.wheel = wheel
+    return app
 
 
 def main(solver=None, window_factory=None, engine_factory=None):

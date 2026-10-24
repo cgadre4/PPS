@@ -30,6 +30,7 @@ def make_engine():
         torch.manual_seed(0)
         eng = E.SimulationEngine(initial_particles=n)
         eng.solver_type = solver
+        assert boundary in E.BOUNDARY_MODES, boundary
         eng.boundary_mode = boundary
         eng.uniform_gravity_mag = 0.0
         eng.sort_interval = 0

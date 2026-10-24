@@ -158,7 +158,8 @@ class MeshRenderer:
             overlay = self._minimap(rho_k, mask, int(camera.width * ui_w / RENDER_CELL_SIZE))
 
         if view.show_potential:
-            image = _sample(solver.phi, self._view_grid_for(camera, engine)).abs_()
+            # The solver keeps phi / phi_unit; rescale on the (small) viewport rather than the whole grid
+            image = _sample(solver.phi_scaled, self._view_grid_for(camera, engine)).abs_().mul_(solver.phi_unit)
             self.render_grid(canvas, image, color_map, view.pot_min_log, view.pot_max_log, 1.0, overlay=overlay)
         elif view.use_bandpass_render and rho_k is not None:
             # Identity band-pass: the filtered density is just the density grid (no inverse FFT)

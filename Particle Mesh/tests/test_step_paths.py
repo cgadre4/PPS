@@ -94,3 +94,42 @@ def test_uniform_gravity_folded_into_kick(make_engine, centre, solver):
     eng.step(0.01)
     assert eng.vel[0, 1].item() == pytest.approx(-1.0, abs=1e-3)
     assert abs(eng.vel[0, 0].item()) < 1e-3
+
+
+def test_neg_gradient_prescaled_skips_the_scale():
+    """AUDIT §9 B1: with prescaled=True the caller has folded 1 / (2 dx) into the source."""
+    g = torch.Generator().manual_seed(7)
+    phi = torch.randn(40, 56, generator=g)
+    cs = 4.0
+    fx, fy = torch.empty_like(phi), torch.empty_like(phi)
+    neg_gradient(phi, fx, fy, cs, True)
+    px, py = torch.empty_like(phi), torch.empty_like(phi)
+    neg_gradient(phi * (0.5 / cs), px, py, cs, True, prescaled=True)
+    assert torch.allclose(fx, px, atol=1e-6) and torch.allclose(fy, py, atol=1e-6)
+
+
+@pytest.mark.parametrize("boundary", ["periodic", "open"])
+def test_phi_is_the_true_potential(make_engine, boundary):
+    """The solver keeps phi / (2 dx); phi (property) undoes that, and the forces are -grad(phi)."""
+    eng = make_engine(5000, boundary=boundary)
+    eng.precompute_kernel()
+    eng.step(1e-6)
+    s = eng.pm_solver
+    assert torch.allclose(s.phi, s.phi_scaled * (2.0 * E.PHYSICS_CELL_SIZE))
+    fx, fy = torch.empty_like(s.phi), torch.empty_like(s.phi)
+    neg_gradient(s.phi, fx, fy, E.PHYSICS_CELL_SIZE, boundary == "periodic")
+    scale = float(s.fx.abs().max())
+    assert (fx[2:-2, 2:-2] - s.fx[2:-2, 2:-2]).abs().max().item() <= 1e-5 * scale + 1e-12
+
+
+def test_harmonic_mean_field_scale_follows_n(make_engine):
+    """AUDIT §9 B2: the harmonic 1/N lives in the cached kernel, so it must be rebuilt when N changes."""
+    eng = make_engine(1000)
+    eng.set_potential('harmonic')
+    eng.step(1e-6)
+    k1 = eng.pm_solver._K_eff
+    eng.add_galaxy(E.UNIVERSE_W / 2, E.UNIVERSE_H / 2, 50.0, count=1000, vel_mult=0.0)
+    eng.step(1e-6)
+    k2 = eng.pm_solver._K_eff
+    assert eng.pm_solver._K_eff_key[2] == 2000
+    assert torch.allclose(k2 * 2.0, k1, rtol=1e-5, atol=0.0)       # twice the particles, half the spring per pair

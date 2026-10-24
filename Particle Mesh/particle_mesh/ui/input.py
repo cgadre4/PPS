@@ -1,9 +1,11 @@
 """
 Keyboard and mouse handling: edge-detected keys, camera pan/zoom, brush resize, panel toggling, and the brush
-action (spawn / erase) for this frame. Taichi 1.7 GGUI (ti.ui.Window) reports no mouse-wheel events, so zoom is
-Ctrl+left drag (or the up/down arrows) and brush size Ctrl+right drag.
+action (spawn / erase) for this frame. Zoom is the mouse wheel (towards the cursor; Taichi 1.7 GGUI has no wheel
+events, so ui/wheel.py reads them from the Windows message loop), Ctrl+left drag, or the up/down arrows; brush size
+is Ctrl+right drag.
 """
 import math
+import time
 from dataclasses import dataclass
 
 import taichi as ti
@@ -13,6 +15,12 @@ DEFAULT_KEYS = (ti.ui.CTRL, 'p', 'f', 'r', 'm', ti.ui.SPACE, ti.ui.RIGHT, ti.ui.
                 ti.ui.LMB, ti.ui.RMB, ti.ui.MMB)
 # Drag sensitivity: zoom / brush radius scale by exp(DRAG_RATE * vertical drag in window heights)
 DRAG_RATE = 5.0
+# Up/Down arrow zoom speed, ln(zoom factor) per second: 1.02x per frame at 120 FPS, now independent of the frame rate
+KEY_ZOOM_RATE = 120.0 * math.log(1.02)
+# Longest frame time the key zoom integrates over (a stalled frame must not jump the zoom)
+MAX_KEY_DT = 0.1
+# Zoom factor per wheel notch, towards the cursor
+WHEEL_ZOOM_STEP = 1.2
 # Clickable "show panel" arrow in the top-left corner (normalised screen coordinates)
 ARROW_MAX_X = 0.04
 ARROW_MIN_Y = 0.95
@@ -56,8 +64,9 @@ class FrameIntent:
 
 
 class InputController:
-    def __init__(self, window, camera, width, height, brush_limits, keys=None):
-        """brush_limits: (min, max) brush radius in screen pixels."""
+    def __init__(self, window, camera, width, height, brush_limits, keys=None, wheel=None, clock=time.perf_counter):
+        """brush_limits: (min, max) brush radius in screen pixels. wheel: callable returning the wheel notches since
+        its last call (ui.wheel.WheelHook.take), or None. clock: seconds, for the frame-rate independent key zoom."""
         self.window = window
         self.keys = keys if keys is not None else KeyEdges(window, DEFAULT_KEYS)
         self.camera = camera
@@ -70,6 +79,16 @@ class InputController:
         self.prev_brush_drag = False
         self.zoom_anchor = (0.5, 0.5)     # normalised cursor position where the zoom drag started
         self.prev_mouse_norm = (0.0, 0.0)
+        self.wheel = wheel
+        self.clock = clock
+        self._last_time = None
+
+    def _frame_dt(self):
+        """Seconds since the previous frame (1/120 on the first one), at most MAX_KEY_DT."""
+        now = self.clock()
+        dt = 1.0 / 120.0 if self._last_time is None else now - self._last_time
+        self._last_time = now
+        return min(max(dt, 0.0), MAX_KEY_DT)
 
     def process(self, engine, palettes, controls, ui_w):
         """Reads this frame's input, applies view/panel changes, and returns the brush action as a FrameIntent."""
@@ -101,11 +120,12 @@ class InputController:
             if e.key == ti.ui.ESCAPE:
                 window.running = False
 
-        # Keyboard zoom
-        if keys.held(ti.ui.UP):
-            camera.zoom_around_mouse(mouse_norm[0] * width, mouse_norm[1] * height, 1.02)
-        if keys.held(ti.ui.DOWN):
-            camera.zoom_around_mouse(mouse_norm[0] * width, mouse_norm[1] * height, 1.0 / 1.02)
+        # Keyboard zoom about the cursor, at a fixed rate per second
+        dt = self._frame_dt()
+        key_zoom = keys.held(ti.ui.UP) - keys.held(ti.ui.DOWN)
+        if key_zoom:
+            camera.zoom_around_mouse(mouse_norm[0] * width, mouse_norm[1] * height,
+                                     math.exp(key_zoom * KEY_ZOOM_RATE * dt))
 
         # Mouse Click/Drag events
         lmb_pressed = keys.held(ti.ui.LMB)
@@ -145,6 +165,11 @@ class InputController:
         hovering_ui = mouse_norm[0] <= ui_w if controls.ui_open else on_arrow
         if keys.pressed(ti.ui.LMB) and not controls.ui_open and on_arrow:
             controls.ui_open = True
+
+        # Wheel zoom towards the cursor; over the panel the wheel belongs to ImGui (scrolling)
+        notches = self.wheel() if self.wheel is not None else 0.0
+        if notches and not hovering_ui:
+            camera.zoom_around_mouse(mouse_norm[0] * width, mouse_norm[1] * height, WHEEL_ZOOM_STEP ** notches)
 
         # Translate cursor to simulation coordinates
         world_x, world_y = camera.screen_to_world(mouse_norm[0] * width, mouse_norm[1] * height)

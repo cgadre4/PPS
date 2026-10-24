@@ -9,7 +9,7 @@ from particle_mesh.render.camera import SimulationCamera
 from particle_mesh.render.colormap import Palettes
 from particle_mesh.render.themes import THEMES
 from particle_mesh.settings import SETTINGS
-from particle_mesh.ui.input import InputController, KeyEdges
+from particle_mesh.ui.input import KEY_ZOOM_RATE, MAX_KEY_DT, WHEEL_ZOOM_STEP, InputController, KeyEdges
 from particle_mesh.ui.state import Controls
 
 W, H = 1000, 500
@@ -42,22 +42,43 @@ class FakeEngine:
         self.show_field = False
 
 
+class FakeClock:
+    """Scripted frame clock: every call advances by `step` seconds (120 FPS by default)."""
+
+    def __init__(self, step=1.0 / 120.0):
+        self.t = 0.0
+        self.step = step
+
+    def __call__(self):
+        self.t += self.step
+        return self.t
+
+
 @pytest.fixture
 def rig():
     window = FakeWindow()
     camera = SimulationCamera(W, H, 8192, 8192)
-    controller = InputController(window, camera, W, H, LIMITS)
+    wheel = SimpleNamespace(notches=0.0)
+
+    def take():
+        n, wheel.notches = wheel.notches, 0.0
+        return n
+
+    clock = FakeClock()
+    controller = InputController(window, camera, W, H, LIMITS, wheel=take, clock=clock)
     controls = Controls.from_settings()
     engine = FakeEngine()
     palettes = SimpleNamespace(cycle=lambda i, step=1: (i + step) % 5)
 
-    def frame(held=(), cursor=None, ui_w=0.15):
+    def frame(held=(), cursor=None, ui_w=0.15, notches=0.0):
         window.held = set(held)
         if cursor is not None:
             window.cursor = cursor
+        wheel.notches += notches
         return controller.process(engine, palettes, controls, ui_w)
 
-    return SimpleNamespace(window=window, camera=camera, controls=controls, engine=engine, frame=frame)
+    return SimpleNamespace(window=window, camera=camera, controls=controls, engine=engine, frame=frame,
+                           clock=clock, wheel=wheel)
 
 
 def test_key_edges_rising_edge_only():
@@ -195,9 +216,55 @@ def test_reset_respects_the_zoom_limit():
 def test_keyboard_zoom(rig):
     z0 = rig.camera.zoom
     rig.frame(held={ti.ui.UP})
-    assert rig.camera.zoom == pytest.approx(z0 * 1.02)
+    assert rig.camera.zoom == pytest.approx(z0 * 1.02)            # 1.02x per frame at 120 FPS, as before
     rig.frame(held={ti.ui.DOWN})
     assert rig.camera.zoom == pytest.approx(z0)
+
+
+@pytest.mark.parametrize("fps", [30.0, 120.0, 240.0])
+def test_keyboard_zoom_is_frame_rate_independent(rig, fps):
+    """One second of holding Up zooms by the same factor at any frame rate (it was 1.02x per frame)."""
+    rig.clock.step = 1.0 / fps
+    rig.frame()                                                    # latch the clock
+    z0 = rig.camera.zoom
+    for _ in range(int(fps)):
+        rig.frame(held={ti.ui.UP})
+    assert rig.camera.zoom == pytest.approx(z0 * math.exp(KEY_ZOOM_RATE))
+
+
+def test_keyboard_zoom_ignores_long_stalls(rig):
+    rig.frame()
+    z0 = rig.camera.zoom
+    rig.clock.step = 5.0                                           # a 5 s hitch must not jump the zoom
+    rig.frame(held={ti.ui.UP})
+    assert rig.camera.zoom == pytest.approx(z0 * math.exp(KEY_ZOOM_RATE * MAX_KEY_DT))
+
+
+def test_wheel_zooms_towards_the_cursor(rig):
+    ref = SimulationCamera(W, H, 8192, 8192)
+    intent = rig.frame(cursor=(0.7, 0.3), notches=2.0)
+    ref.zoom_around_mouse(0.7 * W, 0.3 * H, WHEEL_ZOOM_STEP ** 2)
+    assert rig.camera.zoom == pytest.approx(ref.zoom)
+    assert (rig.camera.cam_x, rig.camera.cam_y) == pytest.approx((ref.cam_x, ref.cam_y))
+    # the world point under the cursor stays put, and the brush maps through the new zoom
+    assert (intent.world_x, intent.world_y) == pytest.approx(rig.camera.screen_to_world(0.7 * W, 0.3 * H))
+    rig.frame(cursor=(0.7, 0.3), notches=-2.0)
+    assert rig.camera.zoom == pytest.approx(SimulationCamera(W, H, 8192, 8192).zoom)
+    assert not intent.spawn and not intent.erase
+
+
+def test_wheel_over_the_panel_does_not_zoom(rig):
+    z0 = rig.camera.zoom
+    rig.frame(cursor=(0.05, 0.5), notches=3.0)                     # over the panel: ImGui scrolls instead
+    rig.frame(cursor=(0.6, 0.5))                                   # the notches were consumed, not deferred
+    assert rig.camera.zoom == z0
+
+
+def test_wheel_respects_zoom_limits(rig):
+    rig.frame(cursor=(0.6, 0.5), notches=-100.0)
+    assert rig.camera.zoom == pytest.approx(rig.camera.min_zoom)
+    rig.frame(cursor=(0.6, 0.5), notches=1000.0)
+    assert rig.camera.zoom == rig.camera.max_zoom
 
 
 def test_r_resets_camera(rig):
@@ -208,10 +275,11 @@ def test_r_resets_camera(rig):
 
 
 class FakeImGui:
-    """Records slider labels and returns scripted values; buttons are never pressed."""
+    """Records slider labels and returns scripted values; buttons in `press` report a click."""
 
-    def __init__(self, values):
+    def __init__(self, values, press=()):
         self.values = values
+        self.press = set(press)
         self.sliders = []
 
     def begin(self, *a):
@@ -224,7 +292,7 @@ class FakeImGui:
         pass
 
     def button(self, label):
-        return False
+        return label in self.press
 
     def slider_float(self, label, value, lo, hi):
         self.sliders.append(label)
@@ -244,3 +312,45 @@ def test_panel_writes_controls_in_place(make_engine):
     assert gui.render(imgui, 60.0) is None
     assert (controls.radius, controls.spawn_vel, controls.spawn_density, controls.log_time) == (123.0, -1.0, 0.5, 1.5)
     assert gui.image_files == []
+
+
+def _panel(make_engine):
+    from particle_mesh.settings import CONFIG
+    from particle_mesh.ui.panel import SimulationGUI
+    eng = make_engine(0)
+    cam = SimulationCamera(W, H, eng.universe_w, eng.universe_h)
+    gui = SimulationGUI(eng, cam, CONFIG, Palettes(THEMES, eng.device), Controls.from_settings(), scan=lambda: [])
+    return gui, cam
+
+
+def test_panel_zoom_slider_and_buttons(make_engine):
+    from particle_mesh.ui.panel import PANEL_ZOOM_STEP
+    gui, cam = _panel(make_engine)
+    centre = gui._scene_centre()
+    assert centre == pytest.approx(((gui.ui_w + (1 - gui.ui_w) / 2) * W, H / 2))
+    world_before = cam.screen_to_world(*centre)
+    gui.render(FakeImGui({"Zoom (log2)": 3.0}), 60.0)
+    assert cam.zoom == pytest.approx(8.0)
+    assert cam.screen_to_world(*centre) == pytest.approx(world_before)     # zooms about the scene centre
+    gui.render(FakeImGui({}, press={"Zoom In"}), 60.0)
+    assert cam.zoom == pytest.approx(8.0 * PANEL_ZOOM_STEP)
+    gui.render(FakeImGui({}, press={"Zoom Out"}), 60.0)
+    assert cam.zoom == pytest.approx(8.0)
+    gui.render(FakeImGui({"Zoom (log2)": -100.0}), 60.0)
+    assert cam.zoom == pytest.approx(cam.min_zoom)
+
+
+def test_untouched_panel_zoom_slider_never_drifts(make_engine):
+    """ImGui returns the slider value as a float32; an untouched slider must leave the camera alone."""
+    import numpy as np
+    gui, cam = _panel(make_engine)
+    cam.zoom_around_mouse(123.0, 45.0, 1.2345678)
+    before = (cam.cam_x, cam.cam_y, cam.zoom)
+
+    class Float32Gui(FakeImGui):
+        def slider_float(self, label, value, lo, hi):
+            return float(np.float32(value))
+
+    for _ in range(20):
+        gui.render(Float32Gui({}), 60.0)
+    assert (cam.cam_x, cam.cam_y, cam.zoom) == before

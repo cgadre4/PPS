@@ -36,9 +36,11 @@ def attraction(potential_type, params, d):
     raise ValueError(f"Unknown potential type: {potential_type}")
 
 
-def uses_analytic_kernel(potential_type, isolated):
-    """Periodic gravity/Coulomb use the exact Fourier-space kernel; every other case a sampled real-space one."""
-    return not isolated and potential_type in ('gravity', 'coulomb')
+def uses_analytic_kernel(potential_type, isolated, force_range=math.inf):
+    """Periodic, unscreened gravity/Coulomb use the exact Fourier-space kernel; every other case a sampled real-space
+    one of the N-body force law. A screened periodic kernel used to be the Yukawa 1/(k^2 + 1/range^2), whose force
+    (r/range) K1(r/range) / r is not N-body's exp(-r/range) / r: ~23% apart at 0.4 x range, ~39% at the range."""
+    return not isolated and potential_type in ('gravity', 'coulomb') and math.isinf(force_range)
 
 
 class PotentialsManager:
@@ -75,6 +77,12 @@ class PotentialsManager:
         cum = torch.cat([torch.zeros(1, dtype=torch.float64), torch.cumsum((a[1:] + a[:-1]) * (0.5 * h), 0)])
         return (cum - cum[-1]).to(device=self.device, dtype=torch.float32), h
 
+    def _sampled_kernel(self, potential_type, params, size_h, size_w):
+        """rfft2 of the sampled radial potential, as real float32. The sample grid is even (minimum-image offsets:
+        V[i] = V[n - i]), so its transform is real up to rounding; keeping only the real part halves the kernel's
+        memory and makes the per-step multiply real x complex (AUDIT §9)."""
+        return torch.fft.rfft2(self._sample_radial(potential_type, params, size_h, size_w)).real.contiguous()
+
     def _sample_radial(self, potential_type, params, size_h, size_w):
         """The radial potential at the minimum-image distance of every cell of a (size_h, size_w) grid from cell
         (0, 0), linearly interpolated from the table. Built in row chunks to bound memory."""
@@ -102,8 +110,9 @@ class PotentialsManager:
         params: dict containing sliders (G, epsilon, sigma, spring_k, force_range, softening_length);
                 force_range = inf means no screening.
 
-        Periodic gravity/Coulomb use the exact Fourier kernel (real float32; the solver adds Gaussian softening).
-        Every other case samples the real-space potential of the N-body force law (attraction()) and FFTs it.
+        Periodic unscreened gravity/Coulomb use the exact Fourier kernel (the solver adds Gaussian softening). Every
+        other case samples the real-space potential of the N-body force law (attraction()) and FFTs it. Every
+        kernel is real float32.
         """
         if potential_type not in ('gravity', 'coulomb', 'harmonic', 'lennard_jones'):
             raise ValueError(f"Unknown potential type: {potential_type}")
@@ -111,22 +120,22 @@ class PotentialsManager:
         if isolated:
             # Free-space convolution (Hockney & Eastwood): no k = 0 removal, the full sum is the physics
             s = self.isolated_size
-            return torch.fft.rfft2(self._sample_radial(potential_type, params, s, s))
+            return self._sampled_kernel(potential_type, params, s, s)
 
-        if uses_analytic_kernel(potential_type, isolated):
+        if uses_analytic_kernel(potential_type, isolated, params.get('force_range', math.inf)):
             # Units (AUDIT 2.11): the 2D law |a| = G * m / r, i.e. lap(phi) = 2*pi*G*rho_area and
-            # phi_k = -2*pi*G * rho_area_k / k^2, screened as Yukawa 1/(k^2 + 1/range^2). Mass is deposited per
-            # CELL, so divide by the cell area (rho_area = rho_cell / cell_size^2).
+            # phi_k = -2*pi*G * rho_area_k / k^2 (unscreened). Mass is deposited per CELL, so divide by the cell area
+            # (rho_area = rho_cell / cell_size^2).
             area_scale = 2.0 * math.pi / (self.cell_size ** 2)
-            lambda_sq = (1.0 / params.get('force_range', math.inf)) ** 2
-            denom = self.k_sq + lambda_sq
-            denom[0, 0] = 1.0   # k = 0 is zeroed below; avoid dividing by ~0 there
+            denom = self.k_sq.clone()
+            denom[0, 0] = 1.0   # k = 0 is zeroed below; avoid dividing by 0 there
             # Gravity attracts (negative); Coulomb repels like charges (positive)
             sign = -1.0 if potential_type == 'gravity' else 1.0
             K_k = (sign * params.get('G', 1.0) * area_scale) / denom
         else:
-            # Harmonic / Lennard-Jones: minimum-image pair potential, the same convention as periodic N-body
-            K_k = torch.fft.rfft2(self._sample_radial(potential_type, params, self.grid_h, self.grid_w))
+            # Harmonic, Lennard-Jones and screened gravity/Coulomb: minimum-image pair potential of the N-body force
+            # law, the same convention as periodic N-body
+            K_k = self._sampled_kernel(potential_type, params, self.grid_h, self.grid_w)
 
         # Zero the k = 0 (mean) mode. It only adds a constant to phi, which exerts no force, but for gravity/Coulomb
         # it equals -/+G * M_total / lambda^2: large enough to destroy float32 precision in phi (and therefore in
@@ -151,8 +160,9 @@ class PotentialsManager:
             return out_x, out_y
 
         p = density if gamma == 1.0 else density ** gamma          # no pow pass when isothermal (AUDIT §8 F22)
-        neg_gradient(p, out_x, out_y, self.cell_size, periodic)    # -grad(P / K), slices (no roll copies)
-        scale = density.clamp(min=density_floor).reciprocal_().mul_(pressure_strength)
+        # Central differences of P / K, slices (no roll copies); the 1 / (2 dx) rides on the 1 / rho scale below
+        neg_gradient(p, out_x, out_y, self.cell_size, periodic, prescaled=True)
+        scale = density.clamp(min=density_floor).reciprocal_().mul_(pressure_strength * 0.5 / self.cell_size)
         return out_x.mul_(scale), out_y.mul_(scale)
 
     def get_uniform_gravity_forces(self, magnitude, angle_deg):

@@ -6,6 +6,15 @@ from particle_mesh.runtime.device import to_taichi
 
 # Only N-body mode draws circles, and it is capped at NBODY_MAX_PARTICLES, so size the buffers to that
 MAX_RENDER_PARTICLES = SETTINGS.circle_buffer_size
+# N-body dot radius (normalised GGUI units) at zoom <= 1. Zooming in grows the dots like world objects, up to
+# DOT_MAX_SCALE times this, so a zoomed-in view shows bigger dots rather than the same specks spread apart.
+DOT_RADIUS = 0.0005
+DOT_MAX_SCALE = 16.0
+
+
+def dot_radius(zoom):
+    """Circle radius for the N-body view at this camera zoom."""
+    return DOT_RADIUS * min(max(zoom, 1.0), DOT_MAX_SCALE)
 
 
 class CircleRenderer:
@@ -26,7 +35,7 @@ class CircleRenderer:
             engine.num_active,
             camera.cam_x, camera.cam_y,
             camera.width / camera.zoom, camera.height / camera.zoom,  # Visible world extent
-            0.0005  # Visual radius
+            dot_radius(camera.zoom)
         )
 
     def _nbody_colors(self, engine, color_map):
